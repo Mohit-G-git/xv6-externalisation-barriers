@@ -87,9 +87,38 @@ The shadow API must distinguish “not shadowed” from “error” (for example
 
 This contract is an initial member interface proposal; cross-member agreement is still needed for registry capacity, shadow return codes, conflict/version semantics, pipe endpoint membership, and journal completion notification.
 
+## Shadow storage (step 3)
+
+`xv6-public/shadow.c` provides the bounded private-block store used by later
+buffer-cache integration. `NSHADOW` entries hold a speculation ID, device,
+block number, allocation state, reference count, and one `BSIZE` data image.
+Entries are indexed by a chained hash table using
+`(speculation_id, device, block_number)`, so the same real block can have
+independent versions in different speculations and duplicate entries cannot be
+created for one speculation.
+
+The initial implementation uses one short-lived spinlock for the table,
+including hash chains, the free list, counters, reference pins, and data
+copies. This is intentionally conservative for step 3; splitting the lock by
+bucket is a step 7 optimization and does not change the API. `shadow_write`
+copies the caller's base-block image on first allocation, enforces the
+per-speculation `NSHADOW_QUOTA` and global `NSHADOW` limits, and returns `-1`
+on exhaustion. It never writes through to the real block. `shadow_read`
+returns `1` for a private hit, `0` for base-view fallback, and `-1` for
+invalid arguments. `shadow_discard` is idempotent and is called during
+terminal speculation cleanup.
+
+Each entry is 512 bytes of data plus 24 bytes of metadata on x86 (32-bit
+alignment), for 34,304 bytes of entry storage across the 64-entry table,
+before hash-head, free-list, lock, and allocator overhead. The table tracks
+current occupancy and peak occupancy through `shadow_count`,
+`shadow_capacity`, and `shadow_peak`.
+
 ## Current implementation boundary
 
-The x86 lifecycle calls and generation-tagged registry are implemented in `syscall.c`, `sysproc.c`, `user.h`, `usys.S`, `proc.c` and the Makefile. Fork inherits a process reference; exec naturally preserves the association; process exit drops its reference and owner exit aborts the context. Commit and abort freeze operation admission and wait for operation references. The filesystem has no shadow, external-output, or journal-publication integration yet, so speculative `write`, create, link, unlink, mkdir and mknod calls fail closed. `xcommit()` therefore succeeds only for an empty context; `xabort()` has no shadow/output resources to discard yet. This is lifecycle infrastructure, not full speculative filesystem behavior.
+The x86 lifecycle calls and generation-tagged registry are implemented in `syscall.c`, `sysproc.c`, `user.h`, `usys.S`, `proc.c` and the Makefile. Fork inherits a process reference; exec naturally preserves the association; process exit drops its reference and owner exit aborts the context. Commit and abort freeze operation admission and wait for operation references. The filesystem has no shadow, external-output, or journal-publication integration yet, so speculative `write`, create, link, unlink, mkdir and mknod calls fail closed. `xcommit()` therefore succeeds only for an empty context;
+`xabort()` discards any shadow entries owned by the context, while output and
+journal publication remain unimplemented. This is lifecycle plus shadow
+storage infrastructure, not full speculative filesystem behavior.
 
 Nested `xbegin()` is currently rejected. Aborted descendants retain the aborted association and cannot mutate until they explicitly begin a fresh context. Committed descendants detach when they next attempt a mutation. These rules avoid treating an aborted shared handle as an ordinary writable process.
-
