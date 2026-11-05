@@ -114,6 +114,12 @@ before hash-head, free-list, lock, and allocator overhead. The table tracks
 current occupancy and peak occupancy through `shadow_count`,
 `shadow_capacity`, and `shadow_peak`.
 
+The capacity milestone is validated by allocating distinct keys until the
+per-speculation quota is reached, confirming that the next allocation returns
+`-1`, and then discarding the context and confirming that its slots can be
+reused. Repeating this with multiple speculation IDs verifies that identical
+device/block pairs remain independent and that discard does not leak entries.
+
 ## Current implementation boundary
 
 The x86 lifecycle calls and generation-tagged registry are implemented in `syscall.c`, `sysproc.c`, `user.h`, `usys.S`, `proc.c` and the Makefile. Fork inherits a process reference; exec naturally preserves the association; process exit drops its reference and owner exit aborts the context. Commit and abort freeze operation admission and wait for operation references. The filesystem has no shadow, external-output, or journal-publication integration yet, so speculative `write`, create, link, unlink, mkdir and mknod calls fail closed. `xcommit()` therefore succeeds only for an empty context;
