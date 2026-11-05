@@ -28,6 +28,7 @@ main(void)
   consoleinit();   // console hardware
   uartinit();      // serial port
   pinit();         // process table
+  shadowinit();    // private speculative block storage
   specinit();      // speculation context registry
   tvinit();        // trap vectors
   binit();         // buffer cache
@@ -115,4 +116,3 @@ pde_t entrypgdir[NPDENTRIES] = {
 // Blank page.
 //PAGEBREAK!
 // Blank page.
-

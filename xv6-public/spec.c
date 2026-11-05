@@ -62,6 +62,7 @@ spec_reclaim_locked(struct spec_ctx *ctx)
   if(ctx->state == SPEC_ACTIVE || ctx->state == SPEC_COMMITTING ||
      ctx->proc_refs != 0 || ctx->op_refs != 0)
     return;
+  shadow_discard(ctx->id);
   generation = ctx->generation + 1;
   if(generation == 0 || generation > SPEC_MAX_GENERATION)
     generation = 1;
@@ -169,6 +170,7 @@ spec_abort(struct proc *p)
     ctx->state = SPEC_ABORTED;
     while(ctx->op_refs != 0)
       sleep(ctx, &spectable.lock);
+    shadow_discard(ctx->id);
     spec_drop_proc_locked(ctx, p);
     result = 0;
   }
