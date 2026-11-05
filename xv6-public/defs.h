@@ -122,6 +122,14 @@ void            wakeup(void*);
 void            yield(void);
 
 // spec.c
+void            shadowinit(void);
+int             shadow_read(int, uint, uint, char*);
+int             shadow_write(int, uint, uint, const char*);
+int             shadow_validate(int);
+void            shadow_discard(int);
+int             shadow_count(int);
+int             shadow_capacity(void);
+int             shadow_peak(void);
 int             spec_abort(struct proc*);
 int             spec_begin(struct proc*);
 int             spec_commit(struct proc*);

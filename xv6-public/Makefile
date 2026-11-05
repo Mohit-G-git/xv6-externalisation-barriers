@@ -17,6 +17,7 @@ OBJS = \
 	proc.o\
 	sleeplock.o\
 	spinlock.o\
+	shadow.o\
 	spec.o\
 	string.o\
 	swtch.o\
