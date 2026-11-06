@@ -83,15 +83,13 @@ test_create_visibility(void)
     return -1;
   close(fd);
 
-  // Nonempty publication is unavailable: it must fail, preserve the private
-  // view and reservations, and leave the context abortable.
-  if(xcommit() >= 0 || xbegin() >= 0)
+  if(xcommit() < 0)
     return -1;
   fd = open("xspec-private", O_RDONLY);
   if(fd < 0 || read(fd, data, 4) != 4 || !is_priv(data))
     return -1;
   close(fd);
-  if(xabort() < 0)
+  if(unlink("xspec-private") < 0)
     return -1;
   return 0;
 }
@@ -111,13 +109,9 @@ test_unlink_visibility(void)
   if(open("xspec-unlink", O_RDONLY) >= 0 ||
      probe_finish(result, 1) < 0)
     return -1;
-  if(xcommit() >= 0 || xabort() < 0)
+  if(xcommit() < 0)
     return -1;
-  fd = open("xspec-unlink", O_RDONLY);
-  if(fd < 0)
-    return -1;
-  close(fd);
-  return 0;
+  return open("xspec-unlink", O_RDONLY) < 0 ? 0 : -1;
 }
 
 static int
@@ -157,12 +151,12 @@ test_write_visibility(void)
     return -1;
   close(result[0]);
   wait();
-  if(xcommit() >= 0 || xabort() < 0)
+  if(xcommit() < 0)
     return -1;
   fd = open("xspec-data", O_RDONLY);
   if(fd < 0 || read(fd, data, 4) != 4 ||
-     data[0] != 'b' || data[1] != 'a' ||
-     data[2] != 's' || data[3] != 'e')
+     data[0] != 's' || data[1] != 'p' ||
+     data[2] != 'e' || data[3] != 'c')
     return -1;
   close(fd);
   unlink("xspec-data");

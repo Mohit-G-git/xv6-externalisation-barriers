@@ -7,7 +7,10 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "spec.h"
+#include "sleeplock.h"
+#include "fs.h"
 #include "shadow.h"
+#include "buf.h"
 
 #define NSPEC 16
 #define SPEC_SLOT_BITS 5
@@ -148,6 +151,7 @@ spec_commit(struct proc *p)
   int result = -1;
   int nblocks;
   int next, seen;
+  uint epoch;
   struct shadow_snapshot snapshot;
   struct shadow_block block;
 
@@ -227,7 +231,11 @@ spec_commit(struct proc *p)
       return -1;
     }
     shadow_snapshot_end(&snapshot);
-    if(nblocks != 0){
+
+    // xv6's begin_op() reserves MAXOPBLOCKS for one operation. Keep the
+    // outer speculative commit atomic by rejecting a larger final set before
+    // touching any real buffer.
+    if(nblocks > MAXOPBLOCKS){
       if(shadow_thaw(id) < 0)
         panic("spec_commit: shadow thaw");
       acquire(&spectable.lock);
@@ -239,7 +247,31 @@ spec_commit(struct proc *p)
       release(&spectable.lock);
       return -1;
     }
-    fs_spec_discard(id);
+
+    // Re-snapshot the frozen set and publish through the ordinary buffer
+    // cache and log. The private image is never installed with bwrite().
+    if(shadow_snapshot_begin(id, &snapshot) < 0)
+      panic("spec_commit: publish snapshot");
+    epoch = log_commit_epoch();
+    if(nblocks > 0)
+      begin_op();
+    while((next = shadow_snapshot_next(&snapshot, &block)) > 0){
+      struct buf *bp;
+
+      bp = bread(block.dev, block.blockno);
+      memmove(bp->data, block.data, BSIZE);
+      log_write(bp);
+      brelse(bp);
+    }
+    if(next < 0 || seen != nblocks)
+      panic("spec_commit: publish snapshot changed");
+    shadow_snapshot_end(&snapshot);
+    if(nblocks > 0){
+      end_op();
+      log_wait_commit(epoch);
+    }
+
+    fs_spec_publish(id);
     shadow_discard(id);
     acquire(&spectable.lock);
     ctx = spec_lookup_locked(id);
