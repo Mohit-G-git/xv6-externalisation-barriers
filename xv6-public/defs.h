@@ -51,6 +51,7 @@ void            iunlock(struct inode*);
 void            iunlockput(struct inode*);
 int             iupdate(struct inode*);
 void            fs_spec_discard(int);
+void            fs_spec_publish(int);
 int             fs_inode_free_allowed(struct inode*);
 int             namecmp(const char*, const char*);
 struct inode*   namei(char*);
@@ -90,6 +91,8 @@ void            microdelay(int);
 // log.c
 void            initlog(int dev);
 void            log_write(struct buf*);
+uint            log_commit_epoch(void);
+void            log_wait_commit(uint);
 void            begin_op();
 void            end_op();
 

@@ -547,6 +547,34 @@ fs_spec_discard(int spec_id)
   }
 }
 
+// The journal has installed real inode-table blocks. Drop speculative views
+// and invalidate cached base inodes so ordinary lookups reload new metadata.
+void
+fs_spec_publish(int spec_id)
+{
+  struct inode *ip;
+  int i;
+
+  fs_spec_discard(spec_id);
+  for(i = 0; i < NINODE; i++){
+    ip = &icache.inode[i];
+    acquire(&icache.lock);
+    if(ip->ref > 0 && ip->spec_id == 0)
+      ip->ref++;
+    else
+      ip = 0;
+    release(&icache.lock);
+    if(ip != 0){
+      acquiresleep(&ip->lock);
+      ip->valid = 0;
+      releasesleep(&ip->lock);
+      acquire(&icache.lock);
+      ip->ref--;
+      release(&icache.lock);
+    }
+  }
+}
+
 // Increment reference count for ip.
 // Returns ip to enable ip = idup(ip1) idiom.
 struct inode*
