@@ -1,1 +1,16 @@
 Externalization Barriers for Speculative Processes.docx
+xv6-public/*.o
+xv6-public/*.d
+xv6-public/*.asm
+xv6-public/*.sym
+xv6-public/bootblock
+xv6-public/entryother
+xv6-public/initcode*
+xv6-public/kernel*
+xv6-public/fs.img
+xv6-public/xv6.img
+xv6-public/xv6memfs.img
+xv6-public/mkfs
+xv6-public/_*
+._*
+xv6-public/._*
