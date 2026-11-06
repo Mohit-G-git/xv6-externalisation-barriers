@@ -92,6 +92,7 @@ found:
   p->spec_id = 0;
   p->spec_fault = 0;
   p->fs_error = 0;
+  p->fs_gate_depth = 0;
 
   release(&ptable.lock);
 

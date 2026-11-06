@@ -51,6 +51,50 @@ struct log log;
 static void recover_from_log(void);
 static void commit();
 
+static void
+log_begin_op_core(uint *epoch)
+{
+  acquire(&log.lock);
+  for(;;){
+    if(log.committing ||
+       log.lh.n + (log.outstanding+1)*MAXOPBLOCKS > LOGSIZE){
+      sleep(&log, &log.lock);
+      continue;
+    }
+    log.outstanding++;
+    if(epoch)
+      *epoch = log.commit_epoch;
+    release(&log.lock);
+    return;
+  }
+}
+
+static void
+log_end_op_core(void)
+{
+  int do_commit = 0;
+
+  acquire(&log.lock);
+  log.outstanding--;
+  if(log.committing)
+    panic("log.committing");
+  if(log.outstanding == 0){
+    do_commit = 1;
+    log.committing = 1;
+  } else
+    wakeup(&log);
+  release(&log.lock);
+
+  if(do_commit){
+    commit();
+    acquire(&log.lock);
+    log.commit_epoch++;
+    log.committing = 0;
+    wakeup(&log);
+    release(&log.lock);
+  }
+}
+
 void
 initlog(int dev)
 {
@@ -149,19 +193,7 @@ recover_from_log(void)
 void
 begin_op(void)
 {
-  acquire(&log.lock);
-  while(1){
-    if(log.committing){
-      sleep(&log, &log.lock);
-    } else if(log.lh.n + (log.outstanding+1)*MAXOPBLOCKS > LOGSIZE){
-      // this op might exhaust log space; wait for commit.
-      sleep(&log, &log.lock);
-    } else {
-      log.outstanding += 1;
-      release(&log.lock);
-      break;
-    }
-  }
+  log_begin_op_core(0);
 }
 
 // called at the end of each FS system call.
@@ -169,33 +201,19 @@ begin_op(void)
 void
 end_op(void)
 {
-  int do_commit = 0;
+  log_end_op_core();
+}
 
-  acquire(&log.lock);
-  log.outstanding -= 1;
-  if(log.committing)
-    panic("log.committing");
-  if(log.outstanding == 0){
-    do_commit = 1;
-    log.committing = 1;
-  } else {
-    // begin_op() may be waiting for log space,
-    // and decrementing log.outstanding has decreased
-    // the amount of reserved space.
-    wakeup(&log);
-  }
-  release(&log.lock);
+void
+log_begin_op_commit(uint *epoch)
+{
+  log_begin_op_core(epoch);
+}
 
-  if(do_commit){
-    // call commit w/o holding locks, since not allowed
-    // to sleep with locks.
-    commit();
-    acquire(&log.lock);
-    log.commit_epoch++;
-    log.committing = 0;
-    wakeup(&log);
-    release(&log.lock);
-  }
+void
+log_end_op_commit(void)
+{
+  log_end_op_core();
 }
 
 // Copy modified blocks from cache to log.

@@ -32,6 +32,7 @@ main(void)
   specinit();      // speculation context registry
   specioinit();    // held speculative console output
   pipeinit();      // pipe registry for speculative visibility
+  fs_gate_init();  // filesystem admission/publication gate
   tvinit();        // trap vectors
   binit();         // buffer cache
   fileinit();      // file table

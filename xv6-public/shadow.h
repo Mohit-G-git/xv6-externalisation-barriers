@@ -46,6 +46,12 @@ int shadow_read(int spec_id, uint dev, uint blockno, char *dst);
 int shadow_write(int spec_id, uint dev, uint blockno, const char *src);
 int shadow_read_image(int spec_id, uint dev, uint blockno, char *dst);
 int shadow_write_image(int spec_id, uint dev, uint blockno, const char *src);
+int shadow_write_versioned(int spec_id, uint dev, uint blockno,
+                           uint base_version, const char *base,
+                           const char *src);
+uint shadow_base_version(uint dev, uint blockno);
+void shadow_note_base_write(uint dev, uint blockno);
+int shadow_validate_versions(int spec_id);
 int shadow_freeze(int spec_id);
 int shadow_thaw(int spec_id);
 int shadow_snapshot_begin(int spec_id, struct shadow_snapshot *snap);

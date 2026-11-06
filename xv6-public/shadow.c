@@ -27,6 +27,8 @@ struct shadow_entry {
   enum shadow_state state;
   uint refs;
   int next;
+  uint base_version;
+  char base[BSIZE];
   char data[BSIZE];
 };
 
@@ -49,6 +51,7 @@ static struct {
   uint peak;
   int frozen_id[NSPEC];
   uint snapshots[NSPEC];
+  uint base_version[NDEV][FSSIZE];
 } shadow_table;
 
 static struct {
@@ -130,6 +133,7 @@ shadowinit(void)
   shadow_table.peak = 0;
   memset(shadow_table.frozen_id, 0, sizeof(shadow_table.frozen_id));
   memset(shadow_table.snapshots, 0, sizeof(shadow_table.snapshots));
+  memset(shadow_table.base_version, 0, sizeof(shadow_table.base_version));
   memset(reservations.entry, 0, sizeof(reservations.entry));
   reservations.next_version = 1;
   for(i = 0; i < NSHADOW; i++){
@@ -176,11 +180,21 @@ shadow_read_image(int spec_id, uint dev, uint blockno, char *dst)
 int
 shadow_write(int spec_id, uint dev, uint blockno, const char *src)
 {
+  return shadow_write_versioned(spec_id, dev, blockno,
+                                shadow_base_version(dev, blockno),
+                                src, src);
+}
+
+int
+shadow_write_versioned(int spec_id, uint dev, uint blockno,
+                       uint base_version, const char *base, const char *src)
+{
   int index, bucket;
   int count;
   int slot;
 
-  if(spec_id <= 0 || src == 0 || (slot = shadow_slot(spec_id)) < 0)
+  if(spec_id <= 0 || base == 0 || src == 0 ||
+     dev >= NDEV || blockno >= FSSIZE || (slot = shadow_slot(spec_id)) < 0)
     return -1;
   acquire(&shadow_table.lock);
   if(shadow_table.frozen_id[slot] != 0){
@@ -204,6 +218,8 @@ shadow_write(int spec_id, uint dev, uint blockno, const char *src)
     shadow_table.entry[index].blockno = blockno;
     shadow_table.entry[index].state = SHADOW_ALLOCATED;
     shadow_table.entry[index].refs = 0;
+    shadow_table.entry[index].base_version = base_version;
+    memmove(shadow_table.entry[index].base, base, BSIZE);
     shadow_table.allocated++;
     if(shadow_table.allocated > shadow_table.peak)
       shadow_table.peak = shadow_table.allocated;
@@ -219,6 +235,52 @@ int
 shadow_write_image(int spec_id, uint dev, uint blockno, const char *src)
 {
   return shadow_write(spec_id, dev, blockno, src);
+}
+
+uint
+shadow_base_version(uint dev, uint blockno)
+{
+  uint version;
+
+  if(dev >= NDEV || blockno >= FSSIZE)
+    return 0;
+  acquire(&shadow_table.lock);
+  version = shadow_table.base_version[dev][blockno];
+  release(&shadow_table.lock);
+  return version;
+}
+
+void
+shadow_note_base_write(uint dev, uint blockno)
+{
+  if(dev >= NDEV || blockno >= FSSIZE)
+    return;
+  acquire(&shadow_table.lock);
+  shadow_table.base_version[dev][blockno]++;
+  if(shadow_table.base_version[dev][blockno] == 0)
+    shadow_table.base_version[dev][blockno] = 1;
+  release(&shadow_table.lock);
+}
+
+int
+shadow_validate_versions(int spec_id)
+{
+  int i;
+  uint version;
+
+  acquire(&shadow_table.lock);
+  for(i = 0; i < NSHADOW; i++){
+    struct shadow_entry *e = &shadow_table.entry[i];
+    if(e->state == SHADOW_ALLOCATED && e->spec_id == spec_id){
+      version = shadow_table.base_version[e->dev][e->blockno];
+      if(version != e->base_version){
+        release(&shadow_table.lock);
+        return -1;
+      }
+    }
+  }
+  release(&shadow_table.lock);
+  return 0;
 }
 
 int

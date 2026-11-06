@@ -33,6 +33,79 @@ struct superblock sb;
 static struct sleeplock fsblocklock[FSBLOCKLOCKS];
 static struct sleeplock fsalloclock;
 
+static struct {
+  struct spinlock lock;
+  int readers;
+  int publishing;
+  int waiting;
+} fsgate;
+
+void
+fs_gate_init(void)
+{
+  initlock(&fsgate.lock, "fsgate");
+  fsgate.readers = 0;
+  fsgate.publishing = 0;
+  fsgate.waiting = 0;
+}
+
+void
+fs_gate_enter(void)
+{
+  if(myproc() != 0 && myproc()->fs_gate_depth > 0){
+    myproc()->fs_gate_depth++;
+    return;
+  }
+  acquire(&fsgate.lock);
+  while(fsgate.publishing || fsgate.waiting)
+    sleep(&fsgate, &fsgate.lock);
+  fsgate.readers++;
+  release(&fsgate.lock);
+  if(myproc() != 0)
+    myproc()->fs_gate_depth = 1;
+}
+
+void
+fs_gate_leave(void)
+{
+  if(myproc() != 0 && myproc()->fs_gate_depth > 1){
+    myproc()->fs_gate_depth--;
+    return;
+  }
+  acquire(&fsgate.lock);
+  if(fsgate.readers <= 0)
+    panic("fs_gate_leave");
+  fsgate.readers--;
+  if(fsgate.readers == 0)
+    wakeup(&fsgate);
+  release(&fsgate.lock);
+  if(myproc() != 0)
+    myproc()->fs_gate_depth = 0;
+}
+
+void
+fs_gate_publish_begin(void)
+{
+  acquire(&fsgate.lock);
+  fsgate.waiting = 1;
+  while(fsgate.readers != 0 || fsgate.publishing)
+    sleep(&fsgate, &fsgate.lock);
+  fsgate.publishing = 1;
+  fsgate.waiting = 0;
+  release(&fsgate.lock);
+}
+
+void
+fs_gate_publish_end(void)
+{
+  acquire(&fsgate.lock);
+  if(!fsgate.publishing)
+    panic("fs_gate_publish_end");
+  fsgate.publishing = 0;
+  wakeup(&fsgate);
+  release(&fsgate.lock);
+}
+
 static void
 fs_note_failure(int spec_id)
 {
@@ -57,17 +130,20 @@ fs_read_image(int spec_id, uint dev, uint blockno, char *dst)
   struct buf *bp;
   int r;
 
+  fs_gate_enter();
   if(spec_id > 0){
     r = shadow_read_image(spec_id, dev, blockno, dst);
     if(r != 0){
       if(r < 0)
         fs_note_failure(spec_id);
+      fs_gate_leave();
       return r < 0 ? -1 : 0;
     }
   }
   bp = bread(dev, blockno);
   memmove(dst, bp->data, BSIZE);
   brelse(bp);
+  fs_gate_leave();
   return 0;
 }
 
@@ -76,9 +152,11 @@ fs_read_base_image(uint dev, uint blockno, char *dst)
 {
   struct buf *bp;
 
+  fs_gate_enter();
   bp = bread(dev, blockno);
   memmove(dst, bp->data, BSIZE);
   brelse(bp);
+  fs_gate_leave();
   return 0;
 }
 
@@ -87,12 +165,29 @@ fs_write_image(int spec_id, uint dev, uint blockno, const char *src)
 {
   struct buf *bp;
 
-  if(spec_id > 0)
-    return shadow_write_image(spec_id, dev, blockno, src);
+  if(spec_id > 0){
+    char base[BSIZE];
+
+    fs_gate_enter();
+    if(fs_read_base_image(dev, blockno, base) < 0){
+      fs_gate_leave();
+      return -1;
+    }
+    {
+      int result = shadow_write_versioned(spec_id, dev, blockno,
+                                          shadow_base_version(dev, blockno),
+                                          base, src);
+      fs_gate_leave();
+      return result;
+    }
+  }
+  fs_gate_enter();
   bp = bread(dev, blockno);
   memmove(bp->data, src, BSIZE);
   log_write(bp);
   brelse(bp);
+  shadow_note_base_write(dev, blockno);
+  fs_gate_leave();
   return 0;
 }
 

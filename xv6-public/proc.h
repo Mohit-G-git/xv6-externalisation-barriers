@@ -49,6 +49,7 @@ struct proc {
   int spec_id;                 // shared speculation handle; 0 means none
   int spec_fault;              // speculative filesystem op could not finish safely
   int fs_error;                // filesystem operation hit a reservation/storage failure
+  int fs_gate_depth;           // nested filesystem admission scopes
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)

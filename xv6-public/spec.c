@@ -248,13 +248,29 @@ spec_commit(struct proc *p)
       return -1;
     }
 
+    // Block new filesystem admissions before conflict validation and keep
+    // exclusive ownership through journal completion and cache refresh.
+    fs_gate_publish_begin();
+    if(shadow_validate_versions(id) < 0){
+      fs_gate_publish_end();
+      if(shadow_thaw(id) < 0)
+        panic("spec_commit: conflict thaw");
+      acquire(&spectable.lock);
+      ctx = spec_lookup_locked(id);
+      if(ctx != 0 && ctx->state == SPEC_COMMITTING)
+        ctx->state = SPEC_ACTIVE;
+      if(ctx != 0)
+        wakeup(ctx);
+      release(&spectable.lock);
+      return -1;
+    }
+
     // Re-snapshot the frozen set and publish through the ordinary buffer
     // cache and log. The private image is never installed with bwrite().
     if(shadow_snapshot_begin(id, &snapshot) < 0)
       panic("spec_commit: publish snapshot");
-    epoch = log_commit_epoch();
-    if(nblocks > 0)
-      begin_op();
+    log_begin_op_commit(&epoch);
+    seen = 0;
     while((next = shadow_snapshot_next(&snapshot, &block)) > 0){
       struct buf *bp;
 
@@ -262,17 +278,18 @@ spec_commit(struct proc *p)
       memmove(bp->data, block.data, BSIZE);
       log_write(bp);
       brelse(bp);
+      seen++;
     }
     if(next < 0 || seen != nblocks)
       panic("spec_commit: publish snapshot changed");
     shadow_snapshot_end(&snapshot);
-    if(nblocks > 0){
-      end_op();
-      log_wait_commit(epoch);
-    }
+    log_end_op_commit();
+    log_wait_commit(epoch);
 
     fs_spec_publish(id);
     shadow_discard(id);
+    spec_output_publish(id);
+    fs_gate_publish_end();
     acquire(&spectable.lock);
     ctx = spec_lookup_locked(id);
     if(ctx == 0 || ctx->state != SPEC_COMMITTING){
@@ -282,7 +299,6 @@ spec_commit(struct proc *p)
     ctx->state = SPEC_COMMITTED;
     wakeup(ctx);
     release(&spectable.lock);
-    spec_output_publish(id);
     acquire(&spectable.lock);
     ctx = spec_lookup_locked(id);
     spec_drop_proc_locked(ctx, p);
