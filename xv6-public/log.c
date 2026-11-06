@@ -42,6 +42,7 @@ struct log {
   int size;
   int outstanding; // how many FS sys calls are executing.
   int committing;  // in commit(), please wait.
+  uint commit_epoch; // increments after each completed journal commit.
   int dev;
   struct logheader lh;
 };
@@ -62,7 +63,30 @@ initlog(int dev)
   log.start = sb.logstart;
   log.size = sb.nlog;
   log.dev = dev;
+  log.commit_epoch = 0;
   recover_from_log();
+}
+
+uint
+log_commit_epoch(void)
+{
+  uint epoch;
+
+  acquire(&log.lock);
+  epoch = log.commit_epoch;
+  release(&log.lock);
+  return epoch;
+}
+
+// Wait for a journal commit after epoch. end_op() may return while another
+// filesystem operation is outstanding and the journal commit is pending.
+void
+log_wait_commit(uint epoch)
+{
+  acquire(&log.lock);
+  while(log.commit_epoch == epoch)
+    sleep(&log, &log.lock);
+  release(&log.lock);
 }
 
 // Copy committed blocks from log to their home location
@@ -167,6 +191,7 @@ end_op(void)
     // to sleep with locks.
     commit();
     acquire(&log.lock);
+    log.commit_epoch++;
     log.committing = 0;
     wakeup(&log);
     release(&log.lock);
@@ -231,4 +256,3 @@ log_write(struct buf *b)
   b->flags |= B_DIRTY; // prevent eviction
   release(&log.lock);
 }
-
