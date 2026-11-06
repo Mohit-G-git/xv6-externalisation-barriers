@@ -189,13 +189,14 @@ paths use the context view. Global reservations arbitrate inode and block
 allocation and represent deferred frees. Partial private-storage failures
 mark the context abort-only.
 
-Member 4's journal publisher and filesystem admission gate are still absent.
-`xcommit()` freezes the context, validates its private set, and enumerates a
-stable snapshot; a nonempty set then returns failure and restores ACTIVE
-without discarding or publishing any block. Empty-context commit can publish
-held Stage 1 output. Abort invalidates the context's cached inode views and
-discards shadow blocks, reservations, and held output. Durable filesystem
-commit, base-version conflict validation, publication-time inode-cache
-refresh, and the shared admission gate remain integration dependencies.
+The journal publisher and exclusive filesystem publication gate are present in
+the x86 implementation. `xcommit()` freezes the context, validates the private
+set and recorded base versions, admits one bounded journal operation, installs
+the stable snapshot through real buffers, waits for journal completion, refreshes
+base inode views, and only then publishes held output. A conflicting base block
+or an oversized set fails before home-buffer publication and leaves the context
+abortable. Abort invalidates speculative inode views and discards shadow blocks,
+reservations and held output. Full read-set/MVCC validation remains a later
+extension; Step 6 validates write-write conflicts only.
 
 Nested `xbegin()` is currently rejected. Aborted descendants retain the aborted association and cannot mutate until they explicitly begin a fresh context. Committed descendants detach when they next attempt a mutation. These rules avoid treating an aborted shared handle as an ordinary writable process.
