@@ -254,7 +254,8 @@ test_shadow_capacity(void)
   if(fd < 0)
     return -1;
   n = write(fd, bulk, sizeof(bulk));
-  if(n >= 0 || xcommit() >= 0 || xabort() < 0 || close(fd) < 0)
+  if(n >= 0 || xcommit() >= 0 || xabort() < 0 || xabort() >= 0 ||
+     close(fd) < 0)
     return -1;
   if(open("xspec-capacity", O_RDONLY) >= 0)
     return -1;
