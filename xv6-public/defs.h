@@ -152,6 +152,7 @@ int             shadow_write(int, uint, uint, const char*);
 int             shadow_write_versioned(int, uint, uint, uint,
                                        const char*, const char*);
 uint            shadow_base_version(uint, uint);
+int             shadow_note_read(int, uint, uint);
 void            shadow_note_base_write(uint, uint);
 int             shadow_validate_versions(int);
 int             shadow_validate(int);

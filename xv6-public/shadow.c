@@ -42,6 +42,17 @@ struct reservation_entry {
   int used;
 };
 
+// A read-only block still participates in optimistic validation.  Keeping
+// this separate from shadow_entry avoids allocating a private block merely
+// because a transaction read it.
+struct read_entry {
+  int spec_id;
+  uint dev;
+  uint blockno;
+  uint version;
+  int used;
+};
+
 static struct {
   struct spinlock lock;
   struct shadow_entry entry[NSHADOW];
@@ -52,6 +63,7 @@ static struct {
   int frozen_id[NSPEC];
   uint snapshots[NSPEC];
   uint base_version[NDEV][FSSIZE];
+  struct read_entry reads[NSPEC_RESERVATIONS];
 } shadow_table;
 
 static struct {
@@ -137,6 +149,7 @@ shadowinit(void)
   memset(shadow_table.frozen_id, 0, sizeof(shadow_table.frozen_id));
   memset(shadow_table.snapshots, 0, sizeof(shadow_table.snapshots));
   memset(shadow_table.base_version, 0, sizeof(shadow_table.base_version));
+  memset(shadow_table.reads, 0, sizeof(shadow_table.reads));
   memset(reservations.entry, 0, sizeof(reservations.entry));
   reservations.next_version = 1;
   for(i = 0; i < NSHADOW; i++){
@@ -148,6 +161,45 @@ shadowinit(void)
     shadow_table.entry[i].next = i + 1;
   }
   shadow_table.entry[NSHADOW - 1].next = -1;
+}
+
+// Record the version seen on a transaction's first read.  This is called
+// while the filesystem admission gate is held, so a successful record and a
+// later publish validation have a well-defined committed base to compare.
+int
+shadow_note_read(int spec_id, uint dev, uint blockno)
+{
+  int i, free_slot;
+  uint version;
+
+  if(spec_id <= 0 || dev >= NDEV || blockno >= FSSIZE)
+    return -1;
+  acquire(&shadow_table.lock);
+  free_slot = -1;
+  for(i = 0; i < NSPEC_RESERVATIONS; i++){
+    if(shadow_table.reads[i].used && shadow_table.reads[i].spec_id == spec_id &&
+       shadow_table.reads[i].dev == dev && shadow_table.reads[i].blockno == blockno){
+      release(&shadow_table.lock);
+      return 0;
+    }
+    if(!shadow_table.reads[i].used && free_slot < 0)
+      free_slot = i;
+  }
+  if(free_slot < 0){
+    release(&shadow_table.lock);
+    SHADOW_TRACE("read_set_full", spec_id, dev, blockno, 0, -1);
+    return -1;
+  }
+  shadow_table.reads[free_slot].spec_id = spec_id;
+  shadow_table.reads[free_slot].dev = dev;
+  shadow_table.reads[free_slot].blockno = blockno;
+  shadow_table.reads[free_slot].version = shadow_table.base_version[dev][blockno];
+  shadow_table.reads[free_slot].used = 1;
+  version = shadow_table.reads[free_slot].version;
+  release(&shadow_table.lock);
+  SHADOW_TRACE("read_set", spec_id, dev, blockno, 0,
+               (int)version);
+  return 0;
 }
 
 // Return 1 for a private version, 0 when the caller must use the base block,
@@ -298,6 +350,21 @@ shadow_validate_versions(int spec_id)
         expected = e->base_version;
         release(&shadow_table.lock);
         SHADOW_TRACE("write_conflict", spec_id, dev, blockno,
+                     (int)expected, (int)version);
+        return -1;
+      }
+    }
+  }
+  for(i = 0; i < NSPEC_RESERVATIONS; i++){
+    struct read_entry *r = &shadow_table.reads[i];
+    if(r->used && r->spec_id == spec_id){
+      version = shadow_table.base_version[r->dev][r->blockno];
+      if(version != r->version){
+        dev = r->dev;
+        blockno = r->blockno;
+        expected = r->version;
+        release(&shadow_table.lock);
+        SHADOW_TRACE("read_conflict", spec_id, dev, blockno,
                      (int)expected, (int)version);
         return -1;
       }
@@ -482,6 +549,9 @@ shadow_discard(int spec_id)
   }
   if(shadow_table.frozen_id[slot] == spec_id)
     shadow_table.frozen_id[slot] = 0;
+  for(i = 0; i < NSPEC_RESERVATIONS; i++)
+    if(shadow_table.reads[i].used && shadow_table.reads[i].spec_id == spec_id)
+      memset(&shadow_table.reads[i], 0, sizeof(shadow_table.reads[i]));
   release(&shadow_table.lock);
   spec_reservation_discard(spec_id);
 }

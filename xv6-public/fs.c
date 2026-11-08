@@ -132,6 +132,11 @@ fs_read_image(int spec_id, uint dev, uint blockno, char *dst)
 
   fs_gate_enter();
   if(spec_id > 0){
+    if(shadow_note_read(spec_id, dev, blockno) < 0){
+      fs_note_failure(spec_id);
+      fs_gate_leave();
+      return -1;
+    }
     r = shadow_read_image(spec_id, dev, blockno, dst);
     if(r != 0){
       if(r < 0)

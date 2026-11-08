@@ -50,6 +50,7 @@ int shadow_write_versioned(int spec_id, uint dev, uint blockno,
                            uint base_version, const char *base,
                            const char *src);
 uint shadow_base_version(uint dev, uint blockno);
+int shadow_note_read(int spec_id, uint dev, uint blockno);
 void shadow_note_base_write(uint dev, uint blockno);
 int shadow_validate_versions(int spec_id);
 int shadow_freeze(int spec_id);
