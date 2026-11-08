@@ -26,7 +26,9 @@ releases the bucket lock, and copies under the entry's `data_lock`;
 reclamation checks the pin count before reuse. Consequently independent
 shadow buckets and private block images can be read or updated concurrently.
 `shadow_lock_stats_get()` exposes bucket acquisitions, observed contention,
-and data-lock acquisitions for workload instrumentation.
+and data-lock acquisitions for workload instrumentation. A dedicated
+`stats_lock` serializes counter updates on SMP; contention is the number of
+acquisition attempts that observed a busy bucket at the sampling point.
 
 Version counters are volatile because shadow transactions are volatile: after
 a reboot both start from an empty epoch.  First reads are recorded once per

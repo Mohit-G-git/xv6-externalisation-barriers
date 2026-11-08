@@ -57,6 +57,7 @@ struct read_entry {
 
 static struct {
   struct spinlock lock;
+  struct spinlock stats_lock;
   struct shadow_entry entry[NSHADOW];
   struct spinlock bucket_lock[NSHADOW_BUCKETS];
   int head[NSHADOW_BUCKETS];
@@ -64,9 +65,9 @@ static struct {
   uint allocated;
   uint peak;
   uint spec_count[NSPEC];
-  volatile uint bucket_acquires;
-  volatile uint bucket_contention;
-  volatile uint data_acquires;
+  uint bucket_acquires;
+  uint bucket_contention;
+  uint data_acquires;
   int frozen_id[NSPEC];
   uint snapshots[NSPEC];
   uint base_version[NDEV][FSSIZE];
@@ -109,9 +110,11 @@ shadow_hash(int spec_id, uint dev, uint blockno)
 static void
 shadow_bucket_acquire(int bucket)
 {
+  acquire(&shadow_table.stats_lock);
   shadow_table.bucket_acquires++;
   if(shadow_table.bucket_lock[bucket].locked)
     shadow_table.bucket_contention++;
+  release(&shadow_table.stats_lock);
   acquire(&shadow_table.bucket_lock[bucket]);
 }
 
@@ -124,7 +127,9 @@ shadow_bucket_release(int bucket)
 static void
 shadow_data_acquire(struct shadow_entry *entry)
 {
+  acquire(&shadow_table.stats_lock);
   shadow_table.data_acquires++;
+  release(&shadow_table.stats_lock);
   acquire(&entry->data_lock);
 }
 
@@ -167,6 +172,7 @@ shadowinit(void)
   int i;
 
   initlock(&shadow_table.lock, "shadow");
+  initlock(&shadow_table.stats_lock, "shadowstats");
   initlock(&reservations.lock, "reservations");
   shadow_table.free_head = 0;
   shadow_table.allocated = 0;
@@ -680,11 +686,11 @@ shadow_lock_stats_get(struct shadow_lock_stats *stats)
 {
   if(stats == 0)
     return;
-  acquire(&shadow_table.lock);
+  acquire(&shadow_table.stats_lock);
   stats->bucket_acquires = shadow_table.bucket_acquires;
   stats->bucket_contention = shadow_table.bucket_contention;
   stats->data_acquires = shadow_table.data_acquires;
-  release(&shadow_table.lock);
+  release(&shadow_table.stats_lock);
 }
 
 static int
