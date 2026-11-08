@@ -327,6 +327,59 @@ test_write_conflict(void)
   return 0;
 }
 
+// A transaction which only reads a committed block must not commit after an
+// outside writer changes that block.  This exercises the MVCC read set rather
+// than the existing write-write conflict path.
+static int
+test_read_conflict(void)
+{
+  int fd, go[2], done[2], pid;
+  char token, value;
+
+  fd = open("xspec-read-conflict", O_CREATE|O_RDWR);
+  if(fd < 0 || write(fd, "R", 1) != 1 || close(fd) < 0 ||
+     pipe(go) < 0 || pipe(done) < 0)
+    return -1;
+  pid = fork();
+  if(pid < 0)
+    return -1;
+  if(pid == 0){
+    close(go[1]);
+    close(done[0]);
+    if(read(go[0], &token, 1) != 1)
+      exit();
+    fd = open("xspec-read-conflict", O_RDWR);
+    if(fd < 0 || write(fd, "W", 1) != 1 || close(fd) < 0)
+      exit();
+    token = 'D';
+    write(done[1], &token, 1);
+    close(go[0]);
+    close(done[1]);
+    exit();
+  }
+  close(go[0]);
+  close(done[1]);
+  if(xbegin() <= 0)
+    return -1;
+  fd = open("xspec-read-conflict", O_RDONLY);
+  if(fd < 0 || read(fd, &value, 1) != 1 || value != 'R' || close(fd) < 0)
+    return -1;
+  token = 'G';
+  if(write(go[1], &token, 1) != 1 || read(done[0], &token, 1) != 1 ||
+     token != 'D')
+    return -1;
+  close(go[1]);
+  close(done[0]);
+  wait();
+  if(xcommit() >= 0 || xabort() < 0)
+    return -1;
+  fd = open("xspec-read-conflict", O_RDONLY);
+  if(fd < 0 || read(fd, &value, 1) != 1 || value != 'W' || close(fd) < 0 ||
+     unlink("xspec-read-conflict") < 0)
+    return -1;
+  return 0;
+}
+
 static int
 test_create_unlink_reuse(void)
 {
@@ -470,6 +523,8 @@ main(void)
     fail("data write visibility and abort");
   if(test_write_conflict() < 0)
     fail("stale write-set conflict validation");
+  if(test_read_conflict() < 0)
+    fail("stale read-set conflict validation");
   if(test_create_unlink_reuse() < 0)
     fail("create/unlink reservation transitions");
   if(test_allocation_arbitration() < 0)
