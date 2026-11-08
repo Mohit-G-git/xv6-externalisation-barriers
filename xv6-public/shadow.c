@@ -30,6 +30,10 @@ struct shadow_entry {
   uint base_version;
   char base[BSIZE];
   char data[BSIZE];
+  // Metadata is protected by shadow_table.lock; the private image uses an
+  // independent lock so unrelated speculative blocks can be copied in
+  // parallel after a reference has pinned their entries.
+  struct spinlock data_lock;
 };
 
 struct reservation_entry {
@@ -157,6 +161,7 @@ shadowinit(void)
   }
   for(i = 0; i < NSHADOW; i++){
     memset(&shadow_table.entry[i], 0, sizeof(shadow_table.entry[i]));
+    initlock(&shadow_table.entry[i].data_lock, "shadowdata");
     shadow_table.entry[i].state = SHADOW_FREE;
     shadow_table.entry[i].next = i + 1;
   }
@@ -219,7 +224,11 @@ shadow_read(int spec_id, uint dev, uint blockno, char *dst)
     return 0;
   }
   shadow_table.entry[index].refs++;
+  release(&shadow_table.lock);
+  acquire(&shadow_table.entry[index].data_lock);
   memmove(dst, shadow_table.entry[index].data, BSIZE);
+  release(&shadow_table.entry[index].data_lock);
+  acquire(&shadow_table.lock);
   shadow_table.entry[index].refs--;
   release(&shadow_table.lock);
   SHADOW_TRACE("block_read", spec_id, dev, blockno, 0, 1);
@@ -272,6 +281,7 @@ shadow_write_versioned(int spec_id, uint dev, uint blockno,
     }
     index = shadow_table.free_head;
     shadow_table.free_head = shadow_table.entry[index].next;
+    initlock(&shadow_table.entry[index].data_lock, "shadowdata");
     bucket = shadow_hash(spec_id, dev, blockno);
     shadow_table.entry[index].next = shadow_table.head[bucket];
     shadow_table.head[bucket] = index;
@@ -288,7 +298,11 @@ shadow_write_versioned(int spec_id, uint dev, uint blockno,
       shadow_table.peak = shadow_table.allocated;
   }
   shadow_table.entry[index].refs++;
+  release(&shadow_table.lock);
+  acquire(&shadow_table.entry[index].data_lock);
   memmove(shadow_table.entry[index].data, src, BSIZE);
+  release(&shadow_table.entry[index].data_lock);
+  acquire(&shadow_table.lock);
   shadow_table.entry[index].refs--;
   release(&shadow_table.lock);
   if(allocated)
@@ -447,8 +461,14 @@ shadow_snapshot_next(struct shadow_snapshot *snap, struct shadow_block *block)
       continue;
     block->dev = shadow_table.entry[i].dev;
     block->blockno = shadow_table.entry[i].blockno;
-    memmove(block->data, shadow_table.entry[i].data, BSIZE);
     snap->cursor++;
+    shadow_table.entry[i].refs++;
+    release(&shadow_table.lock);
+    acquire(&shadow_table.entry[i].data_lock);
+    memmove(block->data, shadow_table.entry[i].data, BSIZE);
+    release(&shadow_table.entry[i].data_lock);
+    acquire(&shadow_table.lock);
+    shadow_table.entry[i].refs--;
     release(&shadow_table.lock);
     return 1;
   }
