@@ -1,0 +1,15 @@
+mode,size_bytes,elapsed_ticks,bytes_written,cpu_count,trial
+write,1024,0,1024,1,1
+write,2048,0,2048,1,1
+write,4096,1,4096,1,1
+write,8192,2,8192,1,1
+write,16384,2,16384,1,1
+write,32768,6,32768,1,1
+write,65536,14,65536,1,1
+write,1024,0,1024,3,1
+write,2048,0,2048,3,1
+write,4096,1,4096,3,1
+write,8192,1,8192,3,1
+write,16384,2,16384,3,1
+write,32768,6,32768,3,1
+write,65536,10,65536,3,1

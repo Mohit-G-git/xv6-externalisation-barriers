@@ -1,0 +1,45 @@
+Baseline run metadata
+--------------------
+Kernel/source revision before this work: 052819f80374d98f328ccab20d1cac5c151c602f
+Worktree during test: modified only by the baseline user program and Makefile UPROGS entry
+QEMU: QEMU emulator version 10.2.4
+Architecture: xv6-public x86, qemu-system-i386
+CPUS: 1
+Command: make CPUS=1 qemu-nox; run `baseline` at the xv6 shell
+Filesystem image: rebuilt by `make fs.img xv6.img` (FSSIZE=1000)
+
+Captured QEMU console output
+----------------------------
+Booting from Hard Disk..xv6...
+cpu0: starting 0
+sb: size 1000 nblocks 941 ninodes 200 nlog 30 logstart 2 inodestart 32 bmap start 58
+init: starting sh
+$ baseline
+baseline: file, unlink, pipe, fork and concurrent writes passed
+baseline: console output check
+benchmark,size_bytes,elapsed_ticks,bytes_written
+write,1024,0,1024
+write,2048,0,2048
+write,4096,1,4096
+write,8192,2,8192
+write,16384,2,16384
+write,32768,6,32768
+write,65536,14,65536
+BASELINE PASS
+$
+
+The benchmark values are one trial using the kernel's coarse global `uptime()` tick counter. They include only the user `write()` call, but tick resolution and QEMU scheduling are coarse; repeat trials and report spread before drawing performance conclusions. The concurrent-write check verifies the resulting file has the expected length and only bytes written by either child; it is a functional smoke test, not a formal atomicity guarantee.
+
+Three-CPU run
+-------------
+Command: make CPUS=3 qemu-nox; run `baseline` at the xv6 shell
+Observed test result: file, unlink, pipe, fork, concurrent writes and all size writes passed
+benchmark,size_bytes,elapsed_ticks,bytes_written
+write,1024,0,1024
+write,2048,0,2048
+write,4096,1,4096
+write,8192,1,8192
+write,16384,2,16384
+write,32768,6,32768
+write,65536,10,65536
+BASELINE PASS
