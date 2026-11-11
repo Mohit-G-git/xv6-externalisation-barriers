@@ -6,6 +6,7 @@
 #include "proc.h"
 #include "x86.h"
 #include "syscall.h"
+#include "spec.h"
 
 // User code makes a system call with INT T_SYSCALL.
 // System call number in %eax.
@@ -138,11 +139,37 @@ void
 syscall(void)
 {
   int num;
+  int lifecycle;
+  struct spec_op op;
   struct proc *curproc = myproc();
 
   num = curproc->tf->eax;
   if(num > 0 && num < NELEM(syscalls) && syscalls[num]) {
-    curproc->tf->eax = syscalls[num]();
+    lifecycle = num == SYS_exit || num == SYS_xbegin ||
+                num == SYS_xcommit || num == SYS_xabort;
+    curproc->spec_fault = 0;
+    curproc->fs_error = 0;
+    if(curproc->spec_id != 0 && !lifecycle){
+      if(spec_op_enter(curproc, &op) < 0){
+        if(curproc->spec_id == 0)
+          curproc->tf->eax = syscalls[num]();
+        else
+          curproc->tf->eax = -1;
+        if(curproc->fs_error)
+          curproc->tf->eax = -1;
+        return;
+      }
+      curproc->tf->eax = syscalls[num]();
+      if(curproc->fs_error)
+        curproc->tf->eax = -1;
+      if(curproc->spec_fault)
+        spec_op_abort_only(&op);
+      spec_op_leave(&op);
+    } else {
+      curproc->tf->eax = syscalls[num]();
+      if(curproc->fs_error)
+        curproc->tf->eax = -1;
+    }
   } else {
     cprintf("%d %s: unknown sys call %d\n",
             curproc->pid, curproc->name, num);

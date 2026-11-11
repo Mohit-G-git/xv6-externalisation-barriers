@@ -286,6 +286,17 @@ consolewrite(struct inode *ip, char *buf, int n)
 }
 
 void
+console_output_publish(const char *buf, int n)
+{
+  int i;
+
+  acquire(&cons.lock);
+  for(i = 0; i < n; i++)
+    consputc(buf[i] & 0xff);
+  release(&cons.lock);
+}
+
+void
 consoleinit(void)
 {
   initlock(&cons.lock, "console");

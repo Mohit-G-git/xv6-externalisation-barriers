@@ -13,6 +13,8 @@
 #include "fs.h"
 #include "shadow.h"
 
+#define NSPEC 16
+
 enum shadow_state {
   SHADOW_FREE = 0,
   SHADOW_ALLOCATED
@@ -28,6 +30,16 @@ struct shadow_entry {
   char data[BSIZE];
 };
 
+struct reservation_entry {
+  int spec_id;
+  int kind;
+  uint dev;
+  uint number;
+  uint version;
+  int state;
+  int used;
+};
+
 static struct {
   struct spinlock lock;
   struct shadow_entry entry[NSHADOW];
@@ -35,7 +47,28 @@ static struct {
   int free_head;
   uint allocated;
   uint peak;
+  int frozen_id[NSPEC];
+  uint snapshots[NSPEC];
 } shadow_table;
+
+static struct {
+  struct spinlock lock;
+  struct reservation_entry entry[NSPEC_RESERVATIONS];
+  uint next_version;
+} reservations;
+
+static int
+shadow_slot(int spec_id)
+{
+  int slot;
+
+  if(spec_id <= 0)
+    return -1;
+  slot = (spec_id & 31) - 1;
+  if(slot < 0 || slot >= NSPEC)
+    return -1;
+  return slot;
+}
 
 static uint
 shadow_hash(int spec_id, uint dev, uint blockno)
@@ -91,9 +124,14 @@ shadowinit(void)
   int i;
 
   initlock(&shadow_table.lock, "shadow");
+  initlock(&reservations.lock, "reservations");
   shadow_table.free_head = 0;
   shadow_table.allocated = 0;
   shadow_table.peak = 0;
+  memset(shadow_table.frozen_id, 0, sizeof(shadow_table.frozen_id));
+  memset(shadow_table.snapshots, 0, sizeof(shadow_table.snapshots));
+  memset(reservations.entry, 0, sizeof(reservations.entry));
+  reservations.next_version = 1;
   for(i = 0; i < NSHADOW; i++){
     shadow_table.head[i] = -1;
   }
@@ -127,6 +165,12 @@ shadow_read(int spec_id, uint dev, uint blockno, char *dst)
   return 1;
 }
 
+int
+shadow_read_image(int spec_id, uint dev, uint blockno, char *dst)
+{
+  return shadow_read(spec_id, dev, blockno, dst);
+}
+
 // Install or replace a private version.  The first write copies the caller's
 // base-block image, so allocation never exposes an uninitialized block.
 int
@@ -134,10 +178,15 @@ shadow_write(int spec_id, uint dev, uint blockno, const char *src)
 {
   int index, bucket;
   int count;
+  int slot;
 
-  if(spec_id <= 0 || src == 0)
+  if(spec_id <= 0 || src == 0 || (slot = shadow_slot(spec_id)) < 0)
     return -1;
   acquire(&shadow_table.lock);
+  if(shadow_table.frozen_id[slot] != 0){
+    release(&shadow_table.lock);
+    return -1;
+  }
   index = shadow_find_locked(spec_id, dev, blockno, 0);
   if(index < 0){
     count = shadow_count_locked(spec_id);
@@ -166,13 +215,144 @@ shadow_write(int spec_id, uint dev, uint blockno, const char *src)
   return 0;
 }
 
-// The initial implementation has no version metadata to validate.  Returning
-// zero means validation succeeded; publication will add conflict checks later.
+int
+shadow_write_image(int spec_id, uint dev, uint blockno, const char *src)
+{
+  return shadow_write(spec_id, dev, blockno, src);
+}
+
+int
+shadow_freeze(int spec_id)
+{
+  int slot;
+
+  if((slot = shadow_slot(spec_id)) < 0)
+    return -1;
+  acquire(&shadow_table.lock);
+  if(shadow_table.frozen_id[slot] != 0){
+    release(&shadow_table.lock);
+    return -1;
+  }
+  shadow_table.frozen_id[slot] = spec_id;
+  release(&shadow_table.lock);
+  return 0;
+}
+
+int
+shadow_thaw(int spec_id)
+{
+  int slot;
+
+  if((slot = shadow_slot(spec_id)) < 0)
+    return -1;
+  acquire(&shadow_table.lock);
+  if(shadow_table.frozen_id[slot] != spec_id ||
+     shadow_table.snapshots[slot] != 0){
+    release(&shadow_table.lock);
+    return -1;
+  }
+  shadow_table.frozen_id[slot] = 0;
+  release(&shadow_table.lock);
+  return 0;
+}
+
+int
+shadow_snapshot_begin(int spec_id, struct shadow_snapshot *snap)
+{
+  int slot;
+
+  if(snap == 0 || (slot = shadow_slot(spec_id)) < 0)
+    return -1;
+  memset(snap, 0, sizeof(*snap));
+  acquire(&shadow_table.lock);
+  if(shadow_table.frozen_id[slot] != spec_id){
+    release(&shadow_table.lock);
+    return -1;
+  }
+  snap->spec_id = spec_id;
+  snap->count = shadow_count_locked(spec_id);
+  snap->active = 1;
+  shadow_table.snapshots[slot]++;
+  release(&shadow_table.lock);
+  return 0;
+}
+
+int
+shadow_snapshot_next(struct shadow_snapshot *snap, struct shadow_block *block)
+{
+  int i, seen;
+
+  if(snap == 0 || block == 0 || !snap->active)
+    return -1;
+  acquire(&shadow_table.lock);
+  seen = 0;
+  for(i = 0; i < NSHADOW; i++){
+    if(shadow_table.entry[i].state != SHADOW_ALLOCATED ||
+       shadow_table.entry[i].spec_id != snap->spec_id)
+      continue;
+    if(seen++ < snap->cursor)
+      continue;
+    block->dev = shadow_table.entry[i].dev;
+    block->blockno = shadow_table.entry[i].blockno;
+    memmove(block->data, shadow_table.entry[i].data, BSIZE);
+    snap->cursor++;
+    release(&shadow_table.lock);
+    return 1;
+  }
+  release(&shadow_table.lock);
+  return 0;
+}
+
+void
+shadow_snapshot_end(struct shadow_snapshot *snap)
+{
+  int slot;
+
+  if(snap == 0 || !snap->active)
+    panic("shadow_snapshot_end");
+  slot = shadow_slot(snap->spec_id);
+  acquire(&shadow_table.lock);
+  if(slot < 0 || shadow_table.snapshots[slot] == 0){
+    release(&shadow_table.lock);
+    panic("shadow_snapshot_end state");
+  }
+  shadow_table.snapshots[slot]--;
+  release(&shadow_table.lock);
+  memset(snap, 0, sizeof(*snap));
+}
+
+// Validate private-set structure only. Base-version conflict validation is a
+// publication responsibility until the block layer records base versions.
 int
 shadow_validate(int spec_id)
 {
+  int i, slot, count;
+
   if(spec_id <= 0)
     return -1;
+  if((slot = shadow_slot(spec_id)) < 0)
+    return -1;
+  acquire(&shadow_table.lock);
+  if(shadow_table.frozen_id[slot] != spec_id){
+    release(&shadow_table.lock);
+    return -1;
+  }
+  count = shadow_count_locked(spec_id);
+  if(count > NSHADOW_QUOTA){
+    release(&shadow_table.lock);
+    return -1;
+  }
+  // The hash insertion path forbids duplicate keys; verify that invariant
+  // while the frozen set is stable before handing it to a publisher.
+  for(i = 0; i < NSHADOW; i++){
+    struct shadow_entry *e = &shadow_table.entry[i];
+    if(e->state == SHADOW_ALLOCATED && e->spec_id == spec_id &&
+       shadow_find_locked(spec_id, e->dev, e->blockno, 0) != i){
+      release(&shadow_table.lock);
+      return -1;
+    }
+  }
+  release(&shadow_table.lock);
   return 0;
 }
 
@@ -180,10 +360,15 @@ void
 shadow_discard(int spec_id)
 {
   int i, index, previous, next;
+  int slot;
 
-  if(spec_id <= 0)
+  if(spec_id <= 0 || (slot = shadow_slot(spec_id)) < 0)
     return;
   acquire(&shadow_table.lock);
+  if(shadow_table.snapshots[slot] != 0){
+    release(&shadow_table.lock);
+    panic("shadow_discard: snapshot active");
+  }
   for(i = 0; i < NSHADOW; i++){
     previous = -1;
     index = shadow_table.head[i];
@@ -209,7 +394,10 @@ shadow_discard(int spec_id)
       index = next;
     }
   }
+  if(shadow_table.frozen_id[slot] == spec_id)
+    shadow_table.frozen_id[slot] = 0;
   release(&shadow_table.lock);
+  spec_reservation_discard(spec_id);
 }
 
 int
@@ -240,4 +428,197 @@ shadow_peak(void)
   peak = shadow_table.peak;
   release(&shadow_table.lock);
   return peak;
+}
+
+static int
+reservation_find_locked(int spec_id, int kind, uint dev, uint number)
+{
+  int i;
+
+  for(i = 0; i < NSPEC_RESERVATIONS; i++)
+    if(reservations.entry[i].used &&
+       reservations.entry[i].spec_id == spec_id &&
+       reservations.entry[i].kind == kind &&
+       reservations.entry[i].dev == dev &&
+       reservations.entry[i].number == number)
+      return i;
+  return -1;
+}
+
+int
+spec_reservation_claim(int spec_id, int kind, uint dev, uint number,
+                       int state, struct spec_reservation_token *token)
+{
+  int i, free_slot, previous;
+  uint previous_version;
+
+  if(token == 0 || spec_id < 0 || (kind != SPEC_RES_INODE &&
+     kind != SPEC_RES_BLOCK) || (state != SPEC_RES_ALLOCATED &&
+     state != SPEC_RES_DEFERRED_FREE))
+    return -1;
+  memset(token, 0, sizeof(*token));
+  acquire(&reservations.lock);
+  free_slot = -1;
+  for(i = 0; i < NSPEC_RESERVATIONS; i++){
+    struct reservation_entry *e = &reservations.entry[i];
+    if(!e->used){
+      if(free_slot < 0)
+        free_slot = i;
+      continue;
+    }
+    if(e->kind == kind && e->dev == dev && e->number == number){
+      if(e->spec_id != spec_id || spec_id == 0){
+        release(&reservations.lock);
+        return -1;
+      }
+      free_slot = i;
+      break;
+    }
+  }
+  if(free_slot < 0){
+    release(&reservations.lock);
+    return -1;
+  }
+  previous = reservations.entry[free_slot].used ?
+             reservations.entry[free_slot].state : 0;
+  previous_version = reservations.entry[free_slot].used ?
+                     reservations.entry[free_slot].version : 0;
+  reservations.entry[free_slot].used = 1;
+  reservations.entry[free_slot].spec_id = spec_id;
+  reservations.entry[free_slot].kind = kind;
+  reservations.entry[free_slot].dev = dev;
+  reservations.entry[free_slot].number = number;
+  reservations.entry[free_slot].state = state;
+  reservations.entry[free_slot].version = reservations.next_version++;
+  if(reservations.entry[free_slot].version == 0){
+    reservations.entry[free_slot].version = reservations.next_version++;
+    if(reservations.entry[free_slot].version == 0)
+      reservations.entry[free_slot].version = 1;
+  }
+  token->spec_id = spec_id;
+  token->kind = kind;
+  token->dev = dev;
+  token->number = number;
+  token->previous_version = previous_version;
+  token->installed_version = reservations.entry[free_slot].version;
+  token->previous_state = previous;
+  token->installed_state = state;
+  token->active = 1;
+  release(&reservations.lock);
+  return 0;
+}
+
+int
+spec_reservation_check(int spec_id, int kind, uint dev, uint number)
+{
+  int i, available;
+
+  if(spec_id < 0 || (kind != SPEC_RES_INODE && kind != SPEC_RES_BLOCK))
+    return 0;
+  acquire(&reservations.lock);
+  available = 1;
+  for(i = 0; i < NSPEC_RESERVATIONS; i++){
+    struct reservation_entry *e = &reservations.entry[i];
+    if(e->used && e->kind == kind && e->dev == dev &&
+       e->number == number &&
+       (e->spec_id != spec_id || spec_id == 0)){
+      available = 0;
+      break;
+    }
+  }
+  release(&reservations.lock);
+  return available;
+}
+
+int
+spec_reservation_state(int spec_id, int kind, uint dev, uint number)
+{
+  int i, state;
+
+  if(spec_id < 0)
+    return -1;
+  acquire(&reservations.lock);
+  i = reservation_find_locked(spec_id, kind, dev, number);
+  if(i >= 0)
+    state = reservations.entry[i].state;
+  else {
+    state = 0;
+    for(i = 0; i < NSPEC_RESERVATIONS; i++)
+      if(reservations.entry[i].used && reservations.entry[i].kind == kind &&
+         reservations.entry[i].dev == dev &&
+         reservations.entry[i].number == number){
+        state = -1;
+        break;
+      }
+  }
+  release(&reservations.lock);
+  return state;
+}
+
+static void
+reservation_restore_locked(struct spec_reservation_token *token)
+{
+  int i;
+
+  i = reservation_find_locked(token->spec_id, token->kind,
+                              token->dev, token->number);
+  if(i < 0 || reservations.entry[i].state != token->installed_state ||
+     reservations.entry[i].version != token->installed_version)
+    return;
+  if(token->previous_state == 0)
+    memset(&reservations.entry[i], 0, sizeof(reservations.entry[i]));
+  else {
+    reservations.entry[i].state = token->previous_state;
+    reservations.entry[i].version = token->previous_version;
+  }
+}
+
+void
+spec_reservation_cancel(struct spec_reservation_token *token)
+{
+  if(token == 0 || !token->active)
+    return;
+  acquire(&reservations.lock);
+  reservation_restore_locked(token);
+  token->active = 0;
+  release(&reservations.lock);
+}
+
+void
+spec_reservation_finish(struct spec_reservation_token *token)
+{
+  int i;
+
+  if(token == 0 || !token->active)
+    return;
+  acquire(&reservations.lock);
+  if(token->spec_id == 0){
+    i = reservation_find_locked(0, token->kind, token->dev, token->number);
+    if(i >= 0 && reservations.entry[i].state == token->installed_state &&
+       reservations.entry[i].version == token->installed_version)
+      memset(&reservations.entry[i], 0, sizeof(reservations.entry[i]));
+  }
+  token->active = 0;
+  release(&reservations.lock);
+}
+
+static void
+reservation_remove_context(int spec_id)
+{
+  int i;
+
+  if(spec_id <= 0)
+    return;
+  acquire(&reservations.lock);
+  for(i = 0; i < NSPEC_RESERVATIONS; i++)
+    if(reservations.entry[i].used &&
+       reservations.entry[i].spec_id == spec_id)
+      memset(&reservations.entry[i], 0, sizeof(reservations.entry[i]));
+  release(&reservations.lock);
+}
+
+void
+spec_reservation_discard(int spec_id)
+{
+  reservation_remove_context(spec_id);
 }

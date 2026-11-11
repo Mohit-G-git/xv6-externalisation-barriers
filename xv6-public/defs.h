@@ -31,8 +31,11 @@ void            fileclose(struct file*);
 struct file*    filedup(struct file*);
 void            fileinit(void);
 int             fileread(struct file*, char*, int n);
+int             fileread_context(struct file*, char*, int, int);
 int             filestat(struct file*, struct stat*);
+int             filestat_context(struct file*, struct stat*, int);
 int             filewrite(struct file*, char*, int n);
+int             filewrite_context(struct file*, char*, int, int);
 
 // fs.c
 void            readsb(int dev, struct superblock *sb);
@@ -40,12 +43,15 @@ int             dirlink(struct inode*, char*, uint);
 struct inode*   dirlookup(struct inode*, char*, uint*);
 struct inode*   ialloc(uint, short);
 struct inode*   idup(struct inode*);
+struct inode*   iget_context(uint, uint, int);
 void            iinit(int dev);
 void            ilock(struct inode*);
 void            iput(struct inode*);
 void            iunlock(struct inode*);
 void            iunlockput(struct inode*);
-void            iupdate(struct inode*);
+int             iupdate(struct inode*);
+void            fs_spec_discard(int);
+int             fs_inode_free_allowed(struct inode*);
 int             namecmp(const char*, const char*);
 struct inode*   namei(char*);
 struct inode*   nameiparent(char*, char*);
@@ -100,6 +106,10 @@ int             pipealloc(struct file**, struct file**);
 void            pipeclose(struct pipe*, int);
 int             piperead(struct pipe*, char*, int);
 int             pipewrite(struct pipe*, char*, int);
+void            pipeinit(void);
+void            pipe_output_publish(int);
+void            pipe_output_discard(int);
+void            pipe_context_wakeup(int);
 
 //PAGEBREAK: 16
 // proc.c
@@ -123,6 +133,10 @@ void            yield(void);
 
 // spec.c
 void            shadowinit(void);
+void            specioinit(void);
+int             spec_console_write(int, const char*, int);
+void            spec_output_publish(int);
+void            spec_output_discard(int);
 int             shadow_read(int, uint, uint, char*);
 int             shadow_write(int, uint, uint, const char*);
 int             shadow_validate(int);
@@ -134,7 +148,6 @@ int             spec_abort(struct proc*);
 int             spec_begin(struct proc*);
 int             spec_commit(struct proc*);
 void            spec_fork_attach(struct proc*, struct proc*);
-int             spec_mutation_allowed(struct proc*);
 void            spec_proc_exit(struct proc*);
 void            specinit(void);
 

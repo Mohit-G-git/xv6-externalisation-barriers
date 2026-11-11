@@ -90,6 +90,8 @@ found:
   p->state = EMBRYO;
   p->pid = nextpid++;
   p->spec_id = 0;
+  p->spec_fault = 0;
+  p->fs_error = 0;
 
   release(&ptable.lock);
 
@@ -232,12 +234,20 @@ exit(void)
 {
   struct proc *curproc = myproc();
   struct proc *p;
+  struct spec_op exitop;
+  int exitref;
   int fd;
 
   if(curproc == initproc)
     panic("init exiting");
 
-  spec_proc_exit(curproc);
+  exitref = 0;
+  if(curproc->spec_id != 0){
+    if(spec_op_enter_exit(curproc, &exitop) == 0)
+      exitref = 1;
+    else
+      spec_proc_exit(curproc);
+  }
 
   // Close all open files.
   for(fd = 0; fd < NOFILE; fd++){
@@ -251,6 +261,11 @@ exit(void)
   iput(curproc->cwd);
   end_op();
   curproc->cwd = 0;
+
+  if(exitref){
+    spec_op_leave(&exitop);
+    spec_proc_exit(curproc);
+  }
 
   acquire(&ptable.lock);
 

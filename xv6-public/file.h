@@ -6,6 +6,7 @@ struct file {
   struct pipe *pipe;
   struct inode *ip;
   uint off;
+  int spec_id;
 };
 
 
@@ -13,9 +14,11 @@ struct file {
 struct inode {
   uint dev;           // Device number
   uint inum;          // Inode number
+  int spec_id;        // Context-specific inode-cache view (0 is base)
   int ref;            // Reference count
   struct sleeplock lock; // protects everything below here
   int valid;          // inode has been read from disk?
+  int spec_dead;      // context view was discarded; close must not mutate it
 
   short type;         // copy of disk inode
   short major;

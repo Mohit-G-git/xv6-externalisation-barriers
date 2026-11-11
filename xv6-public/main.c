@@ -30,6 +30,8 @@ main(void)
   pinit();         // process table
   shadowinit();    // private speculative block storage
   specinit();      // speculation context registry
+  specioinit();    // held speculative console output
+  pipeinit();      // pipe registry for speculative visibility
   tvinit();        // trap vectors
   binit();         // buffer cache
   fileinit();      // file table

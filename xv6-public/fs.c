@@ -20,12 +20,107 @@
 #include "fs.h"
 #include "buf.h"
 #include "file.h"
+#include "shadow.h"
+#include "spec.h"
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
-static void itrunc(struct inode*);
+#define FSBLOCKLOCKS 16
+static int itrunc(struct inode*);
 // there should be one superblock per disk device, but we run with
 // only one device
 struct superblock sb; 
+
+static struct sleeplock fsblocklock[FSBLOCKLOCKS];
+static struct sleeplock fsalloclock;
+
+static void
+fs_note_failure(int spec_id)
+{
+  if(myproc() == 0)
+    return;
+  myproc()->fs_error = 1;
+  if(spec_id > 0 && myproc()->spec_id == spec_id)
+    myproc()->spec_fault = 1;
+}
+
+static uint
+fs_lock_index(uint dev, uint blockno)
+{
+  return (dev * 16777619U + blockno) % FSBLOCKLOCKS;
+}
+
+// Read into a caller-owned image. Speculative callers never receive a shared
+// buffer-cache buffer, and a shadow miss falls back to the committed base.
+static int
+fs_read_image(int spec_id, uint dev, uint blockno, char *dst)
+{
+  struct buf *bp;
+  int r;
+
+  if(spec_id > 0){
+    r = shadow_read_image(spec_id, dev, blockno, dst);
+    if(r != 0){
+      if(r < 0)
+        fs_note_failure(spec_id);
+      return r < 0 ? -1 : 0;
+    }
+  }
+  bp = bread(dev, blockno);
+  memmove(dst, bp->data, BSIZE);
+  brelse(bp);
+  return 0;
+}
+
+static int
+fs_read_base_image(uint dev, uint blockno, char *dst)
+{
+  struct buf *bp;
+
+  bp = bread(dev, blockno);
+  memmove(dst, bp->data, BSIZE);
+  brelse(bp);
+  return 0;
+}
+
+static int
+fs_write_image(int spec_id, uint dev, uint blockno, const char *src)
+{
+  struct buf *bp;
+
+  if(spec_id > 0)
+    return shadow_write_image(spec_id, dev, blockno, src);
+  bp = bread(dev, blockno);
+  memmove(bp->data, src, BSIZE);
+  log_write(bp);
+  brelse(bp);
+  return 0;
+}
+
+// Serialize full-image read/modify/write operations for blocks shared by
+// different inode locks (notably inode-table blocks). The lock is sleepable;
+// no spinlock is held over buffer-cache I/O.
+static int
+fs_update_range(int spec_id, uint dev, uint blockno, uint off,
+                const char *src, uint n)
+{
+  char image[BSIZE];
+  struct sleeplock *lk;
+  int r;
+
+  if(off > BSIZE || n > BSIZE - off || (n > 0 && src == 0))
+    return -1;
+  lk = &fsblocklock[fs_lock_index(dev, blockno)];
+  acquiresleep(lk);
+  r = fs_read_image(spec_id, dev, blockno, image);
+  if(r == 0){
+    memmove(image + off, src, n);
+    r = fs_write_image(spec_id, dev, blockno, image);
+  }
+  releasesleep(lk);
+  if(r < 0)
+    fs_note_failure(spec_id);
+  return r;
+}
 
 // Read the super block.
 void
@@ -39,59 +134,104 @@ readsb(int dev, struct superblock *sb)
 }
 
 // Zero a block.
-static void
-bzero(int dev, int bno)
+static int
+bzero(int dev, int bno, int spec_id)
 {
-  struct buf *bp;
+  char zero[BSIZE];
 
-  bp = bread(dev, bno);
-  memset(bp->data, 0, BSIZE);
-  log_write(bp);
-  brelse(bp);
+  memset(zero, 0, sizeof(zero));
+  return fs_update_range(spec_id, dev, bno, 0, zero, BSIZE);
 }
 
 // Blocks.
 
 // Allocate a zeroed disk block.
 static uint
-balloc(uint dev)
+balloc(uint dev, int spec_id)
 {
   int b, bi, m;
-  struct buf *bp;
+  char image[BSIZE];
+  char base[BSIZE];
+  struct spec_reservation_token token;
+  uchar value;
 
-  bp = 0;
+  acquiresleep(&fsalloclock);
   for(b = 0; b < sb.size; b += BPB){
-    bp = bread(dev, BBLOCK(b, sb));
+    if(fs_read_image(spec_id, dev, BBLOCK(b, sb), image) < 0){
+      releasesleep(&fsalloclock);
+      return 0;
+    }
     for(bi = 0; bi < BPB && b + bi < sb.size; bi++){
       m = 1 << (bi % 8);
-      if((bp->data[bi/8] & m) == 0){  // Is block free?
-        bp->data[bi/8] |= m;  // Mark block in use.
-        log_write(bp);
-        brelse(bp);
-        bzero(dev, b + bi);
+      if((image[bi/8] & m) == 0){  // Is block free in this view?
+        if(spec_id > 0){
+          if(fs_read_base_image(dev, BBLOCK(b, sb), base) < 0){
+            releasesleep(&fsalloclock);
+            return 0;
+          }
+          if((base[bi/8] & m) != 0 &&
+             spec_reservation_state(spec_id, SPEC_RES_BLOCK, dev,
+                                   b + bi) != SPEC_RES_DEFERRED_FREE)
+            continue;
+        }
+        if(spec_reservation_claim(spec_id, SPEC_RES_BLOCK, dev, b + bi,
+                                  SPEC_RES_ALLOCATED, &token) < 0)
+          continue;
+        value = image[bi/8] | m;
+        if(fs_update_range(spec_id, dev, BBLOCK(b, sb), bi/8,
+                           (char*)&value, sizeof(value)) < 0){
+          spec_reservation_cancel(&token);
+          releasesleep(&fsalloclock);
+          return 0;
+        }
+        if(bzero(dev, b + bi, spec_id) < 0){
+          value = image[bi/8] & ~m;
+          if(fs_update_range(spec_id, dev, BBLOCK(b, sb), bi/8,
+                             (char*)&value, sizeof(value)) < 0)
+            fs_note_failure(spec_id);
+          spec_reservation_cancel(&token);
+          releasesleep(&fsalloclock);
+          return 0;
+        }
+        spec_reservation_finish(&token);
+        releasesleep(&fsalloclock);
         return b + bi;
       }
     }
-    brelse(bp);
   }
-  panic("balloc: out of blocks");
+  releasesleep(&fsalloclock);
+  return 0;
 }
 
-// Free a disk block.
-static void
-bfree(int dev, uint b)
+// Free a disk block while fsalloclock is held.
+static int
+bfree_locked(int dev, uint b, int spec_id)
 {
-  struct buf *bp;
-  int bi, m;
+  char image[BSIZE];
+  int bi, m, result;
+  uchar value;
+  struct spec_reservation_token token;
 
-  bp = bread(dev, BBLOCK(b, sb));
+  if(fs_read_image(spec_id, dev, BBLOCK(b, sb), image) < 0){
+    return -1;
+  }
   bi = b % BPB;
   m = 1 << (bi % 8);
-  if((bp->data[bi/8] & m) == 0)
+  if((image[bi/8] & m) == 0){
     panic("freeing free block");
-  bp->data[bi/8] &= ~m;
-  log_write(bp);
-  brelse(bp);
+  }
+  if(spec_reservation_claim(spec_id, SPEC_RES_BLOCK, dev, b,
+                            SPEC_RES_DEFERRED_FREE, &token) < 0){
+    return -1;
+  }
+  value = image[bi/8] & ~m;
+  result = fs_update_range(spec_id, dev, BBLOCK(b, sb), bi/8,
+                           (char*)&value, sizeof(value));
+  if(result < 0)
+    spec_reservation_cancel(&token);
+  else
+    spec_reservation_finish(&token);
+  return result;
 }
 
 // Inodes.
@@ -177,6 +317,9 @@ iinit(int dev)
   for(i = 0; i < NINODE; i++) {
     initsleeplock(&icache.inode[i].lock, "inode");
   }
+  for(i = 0; i < FSBLOCKLOCKS; i++)
+    initsleeplock(&fsblocklock[i], "fsblock");
+  initsleeplock(&fsalloclock, "fsalloc");
 
   readsb(dev, &sb);
   cprintf("sb: size %d nblocks %d ninodes %d nlog %d logstart %d\
@@ -185,7 +328,53 @@ iinit(int dev)
           sb.bmapstart);
 }
 
-static struct inode* iget(uint dev, uint inum);
+static struct inode* iget(uint dev, uint inum, int spec_id);
+
+int
+fs_inode_free_allowed(struct inode *ip)
+{
+  int i, allowed;
+  char image[BSIZE];
+  uint a[NINDIRECT];
+
+  if(ip == 0)
+    return 0;
+  memset(a, 0, sizeof(a));
+  acquiresleep(&fsalloclock);
+  if(ip->addrs[NDIRECT] &&
+     fs_read_image(ip->spec_id, ip->dev, ip->addrs[NDIRECT], image) < 0){
+    releasesleep(&fsalloclock);
+    return 0;
+  }
+  if(ip->addrs[NDIRECT])
+    memmove(a, image, sizeof(a));
+  allowed = 1;
+  for(i = 0; i < NDIRECT; i++)
+    if(ip->addrs[i] && !spec_reservation_check(ip->spec_id,
+         SPEC_RES_BLOCK, ip->dev, ip->addrs[i]))
+      allowed = 0;
+  for(i = 0; i < NINDIRECT; i++)
+    if(a[i] && !spec_reservation_check(ip->spec_id,
+         SPEC_RES_BLOCK, ip->dev, a[i]))
+      allowed = 0;
+  if(ip->addrs[NDIRECT] && !spec_reservation_check(ip->spec_id,
+       SPEC_RES_BLOCK, ip->dev, ip->addrs[NDIRECT]))
+    allowed = 0;
+  releasesleep(&fsalloclock);
+  return allowed;
+}
+
+static int
+base_inode_referenced_locked(uint dev, uint inum)
+{
+  struct inode *ip;
+
+  for(ip = &icache.inode[0]; ip < &icache.inode[NINODE]; ip++)
+    if(ip->ref > 0 && ip->dev == dev && ip->inum == inum &&
+       ip->spec_id == 0)
+      return 1;
+  return 0;
+}
 
 //PAGEBREAK!
 // Allocate an inode on device dev.
@@ -195,51 +384,104 @@ struct inode*
 ialloc(uint dev, short type)
 {
   int inum;
-  struct buf *bp;
+  int spec_id;
+  char image[BSIZE];
+  char base[BSIZE];
   struct dinode *dip;
+  struct dinode newdi;
+  struct spec_reservation_token token;
 
+  spec_id = myproc()->spec_id;
+  acquiresleep(&fsalloclock);
   for(inum = 1; inum < sb.ninodes; inum++){
-    bp = bread(dev, IBLOCK(inum, sb));
-    dip = (struct dinode*)bp->data + inum%IPB;
-    if(dip->type == 0){  // a free inode
-      memset(dip, 0, sizeof(*dip));
-      dip->type = type;
-      log_write(bp);   // mark it allocated on the disk
-      brelse(bp);
-      return iget(dev, inum);
+    if(fs_read_image(spec_id, dev, IBLOCK(inum, sb), image) < 0){
+      releasesleep(&fsalloclock);
+      return 0;
     }
-    brelse(bp);
+    dip = (struct dinode*)image + inum%IPB;
+    if(dip->type == 0){  // a free inode
+      if(spec_id > 0){
+        if(fs_read_base_image(dev, IBLOCK(inum, sb), base) < 0){
+          releasesleep(&fsalloclock);
+          return 0;
+        }
+        dip = (struct dinode*)base + inum%IPB;
+        if(dip->type != 0 &&
+           spec_reservation_state(spec_id, SPEC_RES_INODE, dev, inum) !=
+             SPEC_RES_DEFERRED_FREE)
+          continue;
+      }
+      if(spec_reservation_claim(spec_id, SPEC_RES_INODE, dev, inum,
+                                SPEC_RES_ALLOCATED, &token) < 0)
+        continue;
+      memset(&newdi, 0, sizeof(newdi));
+      newdi.type = type;
+      if(fs_update_range(spec_id, dev, IBLOCK(inum, sb),
+                         (inum % IPB) * sizeof(newdi),
+                         (char*)&newdi, sizeof(newdi)) < 0){
+        spec_reservation_cancel(&token);
+        releasesleep(&fsalloclock);
+        return 0;
+      }
+      spec_reservation_finish(&token);
+      releasesleep(&fsalloclock);
+      return iget(dev, inum, spec_id);
+    }
   }
-  panic("ialloc: no inodes");
+  releasesleep(&fsalloclock);
+  return 0;
 }
 
 // Copy a modified in-memory inode to disk.
 // Must be called after every change to an ip->xxx field
 // that lives on disk, since i-node cache is write-through.
 // Caller must hold ip->lock.
-void
+int
 iupdate(struct inode *ip)
 {
-  struct buf *bp;
-  struct dinode *dip;
+  struct dinode di;
+  struct spec_reservation_token token;
+  int reserved, result;
 
-  bp = bread(ip->dev, IBLOCK(ip->inum, sb));
-  dip = (struct dinode*)bp->data + ip->inum%IPB;
-  dip->type = ip->type;
-  dip->major = ip->major;
-  dip->minor = ip->minor;
-  dip->nlink = ip->nlink;
-  dip->size = ip->size;
-  memmove(dip->addrs, ip->addrs, sizeof(ip->addrs));
-  log_write(bp);
-  brelse(bp);
+  memset(&di, 0, sizeof(di));
+  di.type = ip->type;
+  di.major = ip->major;
+  di.minor = ip->minor;
+  di.nlink = ip->nlink;
+  di.size = ip->size;
+  memmove(di.addrs, ip->addrs, sizeof(ip->addrs));
+  reserved = 0;
+  if(ip->type == 0){
+    acquiresleep(&fsalloclock);
+    if(spec_reservation_claim(ip->spec_id, SPEC_RES_INODE, ip->dev,
+                              ip->inum, SPEC_RES_DEFERRED_FREE,
+                              &token) < 0){
+      fs_note_failure(ip->spec_id);
+      releasesleep(&fsalloclock);
+      return -1;
+    }
+    reserved = 1;
+  }
+  result = fs_update_range(ip->spec_id, ip->dev, IBLOCK(ip->inum, sb),
+                           (ip->inum % IPB) * sizeof(di),
+                           (char*)&di, sizeof(di));
+  if(result < 0){
+    fs_note_failure(ip->spec_id);
+    if(reserved)
+      spec_reservation_cancel(&token);
+  } else if(reserved){
+    spec_reservation_finish(&token);
+  }
+  if(reserved)
+    releasesleep(&fsalloclock);
+  return result;
 }
 
 // Find the inode with number inum on device dev
 // and return the in-memory copy. Does not lock
 // the inode and does not read it from disk.
 static struct inode*
-iget(uint dev, uint inum)
+iget(uint dev, uint inum, int spec_id)
 {
   struct inode *ip, *empty;
 
@@ -248,7 +490,8 @@ iget(uint dev, uint inum)
   // Is the inode already cached?
   empty = 0;
   for(ip = &icache.inode[0]; ip < &icache.inode[NINODE]; ip++){
-    if(ip->ref > 0 && ip->dev == dev && ip->inum == inum){
+    if(ip->ref > 0 && ip->dev == dev && ip->inum == inum &&
+       ip->spec_id == spec_id){
       ip->ref++;
       release(&icache.lock);
       return ip;
@@ -264,11 +507,44 @@ iget(uint dev, uint inum)
   ip = empty;
   ip->dev = dev;
   ip->inum = inum;
+  ip->spec_id = spec_id;
+  ip->spec_dead = 0;
   ip->ref = 1;
   ip->valid = 0;
   release(&icache.lock);
 
   return ip;
+}
+
+struct inode*
+iget_context(uint dev, uint inum, int spec_id)
+{
+  return iget(dev, inum, spec_id);
+}
+
+void
+fs_spec_discard(int spec_id)
+{
+  struct inode *ip;
+  int i;
+
+  for(i = 0; i < NINODE; i++){
+    ip = &icache.inode[i];
+    acquire(&icache.lock);
+    if(ip->ref > 0 && ip->spec_id == spec_id)
+      ip->ref++;
+    else
+      ip = 0;
+    release(&icache.lock);
+    if(ip != 0){
+      acquiresleep(&ip->lock);
+      ip->spec_dead = 1;
+      releasesleep(&ip->lock);
+      acquire(&icache.lock);
+      ip->ref--;
+      release(&icache.lock);
+    }
+  }
 }
 
 // Increment reference count for ip.
@@ -287,7 +563,7 @@ idup(struct inode *ip)
 void
 ilock(struct inode *ip)
 {
-  struct buf *bp;
+  char image[BSIZE];
   struct dinode *dip;
 
   if(ip == 0 || ip->ref < 1)
@@ -295,16 +571,23 @@ ilock(struct inode *ip)
 
   acquiresleep(&ip->lock);
 
+  if(ip->spec_dead){
+    releasesleep(&ip->lock);
+    panic("ilock: discarded view");
+  }
+
   if(ip->valid == 0){
-    bp = bread(ip->dev, IBLOCK(ip->inum, sb));
-    dip = (struct dinode*)bp->data + ip->inum%IPB;
+    if(fs_read_image(ip->spec_id, ip->dev, IBLOCK(ip->inum, sb), image) < 0){
+      releasesleep(&ip->lock);
+      panic("ilock: block view failed");
+    }
+    dip = (struct dinode*)image + ip->inum%IPB;
     ip->type = dip->type;
     ip->major = dip->major;
     ip->minor = dip->minor;
     ip->nlink = dip->nlink;
     ip->size = dip->size;
     memmove(ip->addrs, dip->addrs, sizeof(ip->addrs));
-    brelse(bp);
     ip->valid = 1;
     if(ip->type == 0)
       panic("ilock: no type");
@@ -331,17 +614,26 @@ iunlock(struct inode *ip)
 void
 iput(struct inode *ip)
 {
+  int r, baseheld;
+  short oldtype;
+
   acquiresleep(&ip->lock);
-  if(ip->valid && ip->nlink == 0){
+  if(!ip->spec_dead && ip->valid && ip->nlink == 0){
     acquire(&icache.lock);
-    int r = ip->ref;
+    r = ip->ref;
+    baseheld = ip->spec_id > 0 &&
+               base_inode_referenced_locked(ip->dev, ip->inum);
     release(&icache.lock);
-    if(r == 1){
+    if(r == 1 && !baseheld){
       // inode has no links and no other references: truncate and free.
-      itrunc(ip);
-      ip->type = 0;
-      iupdate(ip);
-      ip->valid = 0;
+      if(itrunc(ip) == 0){
+        oldtype = ip->type;
+        ip->type = 0;
+        if(iupdate(ip) == 0)
+          ip->valid = 0;
+        else
+          ip->type = oldtype;
+      }
     }
   }
   releasesleep(&ip->lock);
@@ -373,26 +665,39 @@ static uint
 bmap(struct inode *ip, uint bn)
 {
   uint addr, *a;
-  struct buf *bp;
+  char image[BSIZE];
 
   if(bn < NDIRECT){
-    if((addr = ip->addrs[bn]) == 0)
-      ip->addrs[bn] = addr = balloc(ip->dev);
+    if((addr = ip->addrs[bn]) == 0){
+      ip->addrs[bn] = addr = balloc(ip->dev, ip->spec_id);
+      if(addr == 0)
+        fs_note_failure(ip->spec_id);
+    }
     return addr;
   }
   bn -= NDIRECT;
 
   if(bn < NINDIRECT){
     // Load indirect block, allocating if necessary.
-    if((addr = ip->addrs[NDIRECT]) == 0)
-      ip->addrs[NDIRECT] = addr = balloc(ip->dev);
-    bp = bread(ip->dev, addr);
-    a = (uint*)bp->data;
-    if((addr = a[bn]) == 0){
-      a[bn] = addr = balloc(ip->dev);
-      log_write(bp);
+    if((addr = ip->addrs[NDIRECT]) == 0){
+      ip->addrs[NDIRECT] = addr = balloc(ip->dev, ip->spec_id);
+      if(addr == 0)
+        fs_note_failure(ip->spec_id);
     }
-    brelse(bp);
+    if(addr == 0 || fs_read_image(ip->spec_id, ip->dev, addr, image) < 0)
+      return 0;
+    a = (uint*)image;
+    if((addr = a[bn]) == 0){
+      a[bn] = addr = balloc(ip->dev, ip->spec_id);
+      if(addr == 0){
+        fs_note_failure(ip->spec_id);
+        return 0;
+      }
+      if(fs_update_range(ip->spec_id, ip->dev,
+                                    ip->addrs[NDIRECT], bn*sizeof(uint),
+                                    (char*)&addr, sizeof(addr)) < 0)
+        return 0;
+    }
     return addr;
   }
 
@@ -404,34 +709,83 @@ bmap(struct inode *ip, uint bn)
 // to it (no directory entries referring to it)
 // and has no in-memory reference to it (is
 // not an open file or current directory).
-static void
+static int
 itrunc(struct inode *ip)
 {
   int i, j;
-  struct buf *bp;
-  uint *a;
+  char image[BSIZE];
+  uint a[NINDIRECT];
+
+  memset(a, 0, sizeof(a));
+  acquiresleep(&fsalloclock);
+  if(ip->addrs[NDIRECT] &&
+     fs_read_image(ip->spec_id, ip->dev, ip->addrs[NDIRECT], image) < 0){
+    fs_note_failure(ip->spec_id);
+    releasesleep(&fsalloclock);
+    return -1;
+  }
+  if(ip->addrs[NDIRECT])
+    memmove(a, image, sizeof(a));
+
+  // Preflight all frees before changing any bitmap image. This prevents an
+  // ordinary or other-context truncation from partially freeing a set when
+  // one resource is already reserved elsewhere.
+  for(i = 0; i < NDIRECT; i++)
+    if(ip->addrs[i] && !spec_reservation_check(ip->spec_id, SPEC_RES_BLOCK,
+                                                ip->dev, ip->addrs[i])){
+      fs_note_failure(ip->spec_id);
+      releasesleep(&fsalloclock);
+      return -1;
+    }
+  for(j = 0; j < NINDIRECT; j++)
+    if(a[j] && !spec_reservation_check(ip->spec_id, SPEC_RES_BLOCK,
+                                       ip->dev, a[j])){
+      fs_note_failure(ip->spec_id);
+      releasesleep(&fsalloclock);
+      return -1;
+    }
+  if(ip->addrs[NDIRECT] &&
+     !spec_reservation_check(ip->spec_id, SPEC_RES_BLOCK, ip->dev,
+                             ip->addrs[NDIRECT])){
+    fs_note_failure(ip->spec_id);
+    releasesleep(&fsalloclock);
+    return -1;
+  }
 
   for(i = 0; i < NDIRECT; i++){
     if(ip->addrs[i]){
-      bfree(ip->dev, ip->addrs[i]);
+      if(bfree_locked(ip->dev, ip->addrs[i], ip->spec_id) < 0){
+        fs_note_failure(ip->spec_id);
+        releasesleep(&fsalloclock);
+        return -1;
+      }
       ip->addrs[i] = 0;
     }
   }
 
   if(ip->addrs[NDIRECT]){
-    bp = bread(ip->dev, ip->addrs[NDIRECT]);
-    a = (uint*)bp->data;
     for(j = 0; j < NINDIRECT; j++){
-      if(a[j])
-        bfree(ip->dev, a[j]);
+      if(a[j]){
+        if(bfree_locked(ip->dev, a[j], ip->spec_id) < 0){
+          fs_note_failure(ip->spec_id);
+          releasesleep(&fsalloclock);
+          return -1;
+        }
+      }
     }
-    brelse(bp);
-    bfree(ip->dev, ip->addrs[NDIRECT]);
+    if(bfree_locked(ip->dev, ip->addrs[NDIRECT], ip->spec_id) < 0){
+      fs_note_failure(ip->spec_id);
+      releasesleep(&fsalloclock);
+      return -1;
+    }
     ip->addrs[NDIRECT] = 0;
   }
+  releasesleep(&fsalloclock);
 
   ip->size = 0;
-  iupdate(ip);
+  if(iupdate(ip) < 0)
+    return -1;
+  return 0;
 }
 
 // Copy stat information from inode.
@@ -453,7 +807,8 @@ int
 readi(struct inode *ip, char *dst, uint off, uint n)
 {
   uint tot, m;
-  struct buf *bp;
+  char image[BSIZE];
+  uint addr;
 
   if(ip->type == T_DEV){
     if(ip->major < 0 || ip->major >= NDEV || !devsw[ip->major].read)
@@ -467,10 +822,13 @@ readi(struct inode *ip, char *dst, uint off, uint n)
     n = ip->size - off;
 
   for(tot=0; tot<n; tot+=m, off+=m, dst+=m){
-    bp = bread(ip->dev, bmap(ip, off/BSIZE));
+    addr = bmap(ip, off/BSIZE);
+    if(addr == 0 || fs_read_image(ip->spec_id, ip->dev, addr, image) < 0){
+      fs_note_failure(ip->spec_id);
+      return -1;
+    }
     m = min(n - tot, BSIZE - off%BSIZE);
-    memmove(dst, bp->data + off%BSIZE, m);
-    brelse(bp);
+    memmove(dst, image + off%BSIZE, m);
   }
   return n;
 }
@@ -482,7 +840,7 @@ int
 writei(struct inode *ip, char *src, uint off, uint n)
 {
   uint tot, m;
-  struct buf *bp;
+  uint addr;
 
   if(ip->type == T_DEV){
     if(ip->major < 0 || ip->major >= NDEV || !devsw[ip->major].write)
@@ -496,11 +854,15 @@ writei(struct inode *ip, char *src, uint off, uint n)
     return -1;
 
   for(tot=0; tot<n; tot+=m, off+=m, src+=m){
-    bp = bread(ip->dev, bmap(ip, off/BSIZE));
+    addr = bmap(ip, off/BSIZE);
+    if(addr == 0){
+      fs_note_failure(ip->spec_id);
+      return -1;
+    }
     m = min(n - tot, BSIZE - off%BSIZE);
-    memmove(bp->data + off%BSIZE, src, m);
-    log_write(bp);
-    brelse(bp);
+    if(fs_update_range(ip->spec_id, ip->dev, addr, off%BSIZE,
+                       src, m) < 0)
+      return -1;
   }
 
   if(n > 0 && off > ip->size){
@@ -532,7 +894,7 @@ dirlookup(struct inode *dp, char *name, uint *poff)
 
   for(off = 0; off < dp->size; off += sizeof(de)){
     if(readi(dp, (char*)&de, off, sizeof(de)) != sizeof(de))
-      panic("dirlookup read");
+      return 0;
     if(de.inum == 0)
       continue;
     if(namecmp(name, de.name) == 0){
@@ -540,7 +902,7 @@ dirlookup(struct inode *dp, char *name, uint *poff)
       if(poff)
         *poff = off;
       inum = de.inum;
-      return iget(dp->dev, inum);
+      return iget(dp->dev, inum, dp->spec_id);
     }
   }
 
@@ -564,7 +926,7 @@ dirlink(struct inode *dp, char *name, uint inum)
   // Look for an empty dirent.
   for(off = 0; off < dp->size; off += sizeof(de)){
     if(readi(dp, (char*)&de, off, sizeof(de)) != sizeof(de))
-      panic("dirlink read");
+      return -1;
     if(de.inum == 0)
       break;
   }
@@ -572,7 +934,7 @@ dirlink(struct inode *dp, char *name, uint inum)
   strncpy(de.name, name, DIRSIZ);
   de.inum = inum;
   if(writei(dp, (char*)&de, off, sizeof(de)) != sizeof(de))
-    panic("dirlink");
+    return -1;
 
   return 0;
 }
@@ -625,11 +987,17 @@ static struct inode*
 namex(char *path, int nameiparent, char *name)
 {
   struct inode *ip, *next;
+  struct proc *p;
+  int spec_id;
+
+  p = myproc();
+  spec_id = p == 0 ? 0 : p->spec_id;
 
   if(*path == '/')
-    ip = iget(ROOTDEV, ROOTINO);
+    ip = iget(ROOTDEV, ROOTINO, spec_id);
   else
-    ip = idup(myproc()->cwd);
+    ip = iget(myproc()->cwd->dev, myproc()->cwd->inum,
+              spec_id);
 
   while((path = skipelem(path, name)) != 0){
     ilock(ip);

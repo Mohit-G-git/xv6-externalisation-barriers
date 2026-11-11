@@ -18,6 +18,7 @@ OBJS = \
 	sleeplock.o\
 	spinlock.o\
 	shadow.o\
+	specio.o\
 	spec.o\
 	string.o\
 	swtch.o\
@@ -186,6 +187,7 @@ UPROGS=\
 	_mytest\
 	_baseline\
 	_xspec\
+	_xio\
 
 fs.img: mkfs README $(UPROGS)
 	./mkfs fs.img README $(UPROGS)

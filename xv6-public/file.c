@@ -5,6 +5,9 @@
 #include "types.h"
 #include "defs.h"
 #include "param.h"
+#include "mmu.h"
+#include "proc.h"
+#include "spec.h"
 #include "fs.h"
 #include "spinlock.h"
 #include "sleeplock.h"
@@ -32,6 +35,7 @@ filealloc(void)
   for(f = ftable.file; f < ftable.file + NFILE; f++){
     if(f->ref == 0){
       f->ref = 1;
+      f->spec_id = 0;
       release(&ftable.lock);
       return f;
     }
@@ -68,6 +72,7 @@ fileclose(struct file *f)
   ff = *f;
   f->ref = 0;
   f->type = FD_NONE;
+  f->spec_id = 0;
   release(&ftable.lock);
 
   if(ff.type == FD_PIPE)
@@ -77,16 +82,45 @@ fileclose(struct file *f)
     iput(ff.ip);
     end_op();
   }
+  if(ff.spec_id > 0)
+    spec_file_detach(ff.spec_id);
+}
+
+static int
+file_context_valid(struct file *f, int spec_id)
+{
+  if(f->spec_id == 0 || f->spec_id == spec_id)
+    return 1;
+  // Empty-context commits may detach a handle into the identical base view.
+  // Aborted or still-active handles cannot be used from another context.
+  return spec_context_state(f->spec_id) == SPEC_COMMITTED;
 }
 
 // Get metadata about file f.
 int
 filestat(struct file *f, struct stat *st)
 {
+  return filestat_context(f, st, myproc()->spec_id);
+}
+
+int
+filestat_context(struct file *f, struct stat *st, int spec_id)
+{
+  struct inode *ip;
+
   if(f->type == FD_INODE){
-    ilock(f->ip);
-    stati(f->ip, st);
-    iunlock(f->ip);
+    if(!file_context_valid(f, spec_id))
+      return -1;
+    ip = f->ip;
+    if(ip->spec_id != spec_id)
+      ip = iget_context(ip->dev, ip->inum, spec_id);
+    if(ip == 0)
+      return -1;
+    ilock(ip);
+    stati(ip, st);
+    iunlock(ip);
+    if(ip != f->ip)
+      iput(ip);
     return 0;
   }
   return -1;
@@ -96,17 +130,33 @@ filestat(struct file *f, struct stat *st)
 int
 fileread(struct file *f, char *addr, int n)
 {
+  return fileread_context(f, addr, n, myproc()->spec_id);
+}
+
+int
+fileread_context(struct file *f, char *addr, int n, int spec_id)
+{
   int r;
+  struct inode *ip;
 
   if(f->readable == 0)
     return -1;
   if(f->type == FD_PIPE)
     return piperead(f->pipe, addr, n);
   if(f->type == FD_INODE){
-    ilock(f->ip);
-    if((r = readi(f->ip, addr, f->off, n)) > 0)
+    if(!file_context_valid(f, spec_id))
+      return -1;
+    ip = f->ip;
+    if(ip->spec_id != spec_id)
+      ip = iget_context(ip->dev, ip->inum, spec_id);
+    if(ip == 0)
+      return -1;
+    ilock(ip);
+    if((r = readi(ip, addr, f->off, n)) > 0)
       f->off += r;
-    iunlock(f->ip);
+    iunlock(ip);
+    if(ip != f->ip)
+      iput(ip);
     return r;
   }
   panic("fileread");
@@ -117,13 +167,27 @@ fileread(struct file *f, char *addr, int n)
 int
 filewrite(struct file *f, char *addr, int n)
 {
+  return filewrite_context(f, addr, n, myproc()->spec_id);
+}
+
+int
+filewrite_context(struct file *f, char *addr, int n, int spec_id)
+{
   int r;
+  struct inode *ip;
 
   if(f->writable == 0)
     return -1;
   if(f->type == FD_PIPE)
     return pipewrite(f->pipe, addr, n);
   if(f->type == FD_INODE){
+    if(!file_context_valid(f, spec_id))
+      return -1;
+    ip = f->ip;
+    if(ip->spec_id != spec_id)
+      ip = iget_context(ip->dev, ip->inum, spec_id);
+    if(ip == 0)
+      return -1;
     // write a few blocks at a time to avoid exceeding
     // the maximum log transaction size, including
     // i-node, indirect block, allocation blocks,
@@ -137,19 +201,26 @@ filewrite(struct file *f, char *addr, int n)
       if(n1 > max)
         n1 = max;
 
-      begin_op();
-      ilock(f->ip);
-      if ((r = writei(f->ip, addr + i, f->off, n1)) > 0)
+      if(spec_id == 0)
+        begin_op();
+      ilock(ip);
+      if ((r = writei(ip, addr + i, f->off, n1)) > 0)
         f->off += r;
-      iunlock(f->ip);
-      end_op();
+      iunlock(ip);
+      if(spec_id == 0)
+        end_op();
 
-      if(r < 0)
+      if(r < 0){
+        if(spec_id > 0)
+          myproc()->spec_fault = 1;
         break;
+      }
       if(r != n1)
         panic("short filewrite");
       i += r;
     }
+    if(ip != f->ip)
+      iput(ip);
     return i == n ? n : -1;
   }
   panic("filewrite");

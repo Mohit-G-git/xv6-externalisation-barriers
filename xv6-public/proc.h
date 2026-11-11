@@ -47,6 +47,8 @@ struct proc {
   void *chan;                  // If non-zero, sleeping on chan
   int killed;                  // If non-zero, have been killed
   int spec_id;                 // shared speculation handle; 0 means none
+  int spec_fault;              // speculative filesystem op could not finish safely
+  int fs_error;                // filesystem operation hit a reservation/storage failure
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)

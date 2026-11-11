@@ -11,6 +11,7 @@
 #include "mmu.h"
 #include "proc.h"
 #include "spec.h"
+#include "shadow.h"
 #include "fs.h"
 #include "spinlock.h"
 #include "sleeplock.h"
@@ -76,21 +77,30 @@ sys_read(void)
 
   if(argfd(0, 0, &f) < 0 || argint(2, &n) < 0 || argptr(1, &p, n) < 0)
     return -1;
-  return fileread(f, p, n);
+  return fileread_context(f, p, n, myproc()->spec_id);
 }
 
 int
 sys_write(void)
 {
   struct file *f;
+  struct proc *pr;
   int n;
-  char *p;
+  char *addr;
 
-  if(!spec_mutation_allowed(myproc()))
+  if(argfd(0, 0, &f) < 0 || argint(2, &n) < 0 || argptr(1, &addr, n) < 0)
     return -1;
-  if(argfd(0, 0, &f) < 0 || argint(2, &n) < 0 || argptr(1, &p, n) < 0)
-    return -1;
-  return filewrite(f, p, n);
+  pr = myproc();
+  if(pr->spec_id == 0)
+    return filewrite(f, addr, n);
+  if(f->type == FD_PIPE)
+    return filewrite(f, addr, n);
+  if(f->type == FD_INODE && f->ip->type == T_DEV &&
+     f->ip->major == CONSOLE)
+    return spec_console_write(pr->spec_id, addr, n);
+  if(f->type == FD_INODE && f->ip->type != T_DEV)
+    return filewrite_context(f, addr, n, pr->spec_id);
+  return -1;
 }
 
 int
@@ -114,7 +124,7 @@ sys_fstat(void)
 
   if(argfd(0, 0, &f) < 0 || argptr(1, (void*)&st, sizeof(*st)) < 0)
     return -1;
-  return filestat(f, st);
+  return filestat_context(f, st, myproc()->spec_id);
 }
 
 // Create the path new as a link to the same inode as old.
@@ -124,8 +134,6 @@ sys_link(void)
   char name[DIRSIZ], *new, *old;
   struct inode *dp, *ip;
 
-  if(!spec_mutation_allowed(myproc()))
-    return -1;
   if(argstr(0, &old) < 0 || argstr(1, &new) < 0)
     return -1;
 
@@ -177,8 +185,12 @@ isdirempty(struct inode *dp)
   struct dirent de;
 
   for(off=2*sizeof(de); off<dp->size; off+=sizeof(de)){
-    if(readi(dp, (char*)&de, off, sizeof(de)) != sizeof(de))
-      panic("isdirempty: readi");
+    if(readi(dp, (char*)&de, off, sizeof(de)) != sizeof(de)){
+      myproc()->fs_error = 1;
+      if(myproc()->spec_id != 0)
+        myproc()->spec_fault = 1;
+      return -1;
+    }
     if(de.inum != 0)
       return 0;
   }
@@ -193,9 +205,12 @@ sys_unlink(void)
   struct dirent de;
   char name[DIRSIZ], *path;
   uint off;
+  struct spec_reservation_token inode_reservation;
+  int reserved, spec_id, empty;
 
-  if(!spec_mutation_allowed(myproc()))
-    return -1;
+  reserved = 0;
+  spec_id = myproc()->spec_id;
+
   if(argstr(0, &path) < 0)
     return -1;
 
@@ -217,14 +232,38 @@ sys_unlink(void)
 
   if(ip->nlink < 1)
     panic("unlink: nlink < 1");
-  if(ip->type == T_DIR && !isdirempty(ip)){
-    iunlockput(ip);
-    goto bad;
+  if(ip->type == T_DIR){
+    empty = isdirempty(ip);
+    if(empty != 1){
+      iunlockput(ip);
+      goto bad;
+    }
+  }
+
+  if(ip->nlink == 1){
+    if(!fs_inode_free_allowed(ip)){
+      myproc()->fs_error = 1;
+      myproc()->spec_fault = spec_id != 0;
+      iunlockput(ip);
+      goto bad;
+    }
+    if(spec_reservation_claim(spec_id, SPEC_RES_INODE, ip->dev, ip->inum,
+                              SPEC_RES_DEFERRED_FREE,
+                              &inode_reservation) < 0){
+      iunlockput(ip);
+      goto bad;
+    }
+    reserved = 1;
   }
 
   memset(&de, 0, sizeof(de));
-  if(writei(dp, (char*)&de, off, sizeof(de)) != sizeof(de))
-    panic("unlink: writei");
+  if(writei(dp, (char*)&de, off, sizeof(de)) != sizeof(de)){
+    myproc()->spec_fault = myproc()->spec_id != 0;
+    if(reserved)
+      spec_reservation_cancel(&inode_reservation);
+    iunlockput(ip);
+    goto bad;
+  }
   if(ip->type == T_DIR){
     dp->nlink--;
     iupdate(dp);
@@ -233,6 +272,12 @@ sys_unlink(void)
 
   ip->nlink--;
   iupdate(ip);
+  if(reserved){
+    if(myproc()->spec_fault)
+      spec_reservation_cancel(&inode_reservation);
+    else
+      spec_reservation_finish(&inode_reservation);
+  }
   iunlockput(ip);
 
   end_op();
@@ -264,8 +309,10 @@ create(char *path, short type, short major, short minor)
     return 0;
   }
 
-  if((ip = ialloc(dp->dev, type)) == 0)
-    panic("create: ialloc");
+  if((ip = ialloc(dp->dev, type)) == 0){
+    iunlockput(dp);
+    return 0;
+  }
 
   ilock(ip);
   ip->major = major;
@@ -277,12 +324,29 @@ create(char *path, short type, short major, short minor)
     dp->nlink++;  // for ".."
     iupdate(dp);
     // No ip->nlink++ for ".": avoid cyclic ref count.
-    if(dirlink(ip, ".", ip->inum) < 0 || dirlink(ip, "..", dp->inum) < 0)
-      panic("create dots");
+    if(dirlink(ip, ".", ip->inum) < 0 || dirlink(ip, "..", dp->inum) < 0){
+      myproc()->spec_fault = myproc()->spec_id != 0;
+      // The inode is not yet linked from dp. Undo the parent link count and
+      // drop the new inode's link so iput truncates any partially built data.
+      dp->nlink--;
+      iupdate(dp);
+      ip->nlink = 0;
+      iupdate(ip);
+      iunlockput(ip);
+      iunlockput(dp);
+      return 0;
+    }
   }
 
-  if(dirlink(dp, name, ip->inum) < 0)
-    panic("create: dirlink");
+  if(dirlink(dp, name, ip->inum) < 0){
+    myproc()->spec_fault = myproc()->spec_id != 0;
+    // No directory entry was installed; reclaim the unlinked new inode.
+    ip->nlink = 0;
+    iupdate(ip);
+    iunlockput(ip);
+    iunlockput(dp);
+    return 0;
+  }
 
   iunlockput(dp);
 
@@ -299,9 +363,6 @@ sys_open(void)
 
   if(argstr(0, &path) < 0 || argint(1, &omode) < 0)
     return -1;
-  if((omode & O_CREATE) && !spec_mutation_allowed(myproc()))
-    return -1;
-
   begin_op();
 
   if(omode & O_CREATE){
@@ -324,6 +385,10 @@ sys_open(void)
   }
 
   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
+    if((omode & O_CREATE) && myproc()->spec_id != 0){
+      myproc()->fs_error = 1;
+      myproc()->spec_fault = 1;
+    }
     if(f)
       fileclose(f);
     iunlockput(ip);
@@ -338,6 +403,14 @@ sys_open(void)
   f->off = 0;
   f->readable = !(omode & O_WRONLY);
   f->writable = (omode & O_WRONLY) || (omode & O_RDWR);
+  if(myproc()->spec_id != 0){
+    if(spec_file_attach(myproc()->spec_id) < 0){
+      myproc()->ofile[fd] = 0;
+      fileclose(f);
+      return -1;
+    }
+    f->spec_id = myproc()->spec_id;
+  }
   return fd;
 }
 
@@ -347,8 +420,6 @@ sys_mkdir(void)
   char *path;
   struct inode *ip;
 
-  if(!spec_mutation_allowed(myproc()))
-    return -1;
   begin_op();
   if(argstr(0, &path) < 0 || (ip = create(path, T_DIR, 0, 0)) == 0){
     end_op();
@@ -366,8 +437,6 @@ sys_mknod(void)
   char *path;
   int major, minor;
 
-  if(!spec_mutation_allowed(myproc()))
-    return -1;
   begin_op();
   if((argstr(0, &path)) < 0 ||
      argint(1, &major) < 0 ||
