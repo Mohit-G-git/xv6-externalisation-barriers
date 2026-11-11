@@ -79,11 +79,17 @@ The shadow API must distinguish “not shadowed” from “error” (for example
 ### Integration sequence
 
 1. Land the registry and process-reference lifecycle independently of shadow storage.
-2. Add syscall ABI and owner-only lifecycle handlers, first returning safe errors until publication/discard hooks exist.
+2. Add the syscall ABI and owner-only lifecycle handlers; fail closed on mutations until publication/discard hooks exist.
 3. Connect fork/exec/exit and verify context lifetime.
 4. Integrate the agreed shadow interface with buffer cache and filesystem.
 5. Integrate console/pipe output handling.
 6. Connect validated shadow publication to a journal completion point and only then publish held output.
 
 This contract is an initial member interface proposal; cross-member agreement is still needed for registry capacity, shadow return codes, conflict/version semantics, pipe endpoint membership, and journal completion notification.
+
+## Current implementation boundary
+
+The x86 lifecycle calls and generation-tagged registry are implemented in `syscall.c`, `sysproc.c`, `user.h`, `usys.S`, `proc.c` and the Makefile. Fork inherits a process reference; exec naturally preserves the association; process exit drops its reference and owner exit aborts the context. Commit and abort freeze operation admission and wait for operation references. The filesystem has no shadow, external-output, or journal-publication integration yet, so speculative `write`, create, link, unlink, mkdir and mknod calls fail closed. `xcommit()` therefore succeeds only for an empty context; `xabort()` has no shadow/output resources to discard yet. This is lifecycle infrastructure, not full speculative filesystem behavior.
+
+Nested `xbegin()` is currently rejected. Aborted descendants retain the aborted association and cannot mutate until they explicitly begin a fresh context. Committed descendants detach when they next attempt a mutation. These rules avoid treating an aborted shared handle as an ordinary writable process.
 

@@ -10,6 +10,7 @@
 #include "stat.h"
 #include "mmu.h"
 #include "proc.h"
+#include "spec.h"
 #include "fs.h"
 #include "spinlock.h"
 #include "sleeplock.h"
@@ -85,6 +86,8 @@ sys_write(void)
   int n;
   char *p;
 
+  if(!spec_mutation_allowed(myproc()))
+    return -1;
   if(argfd(0, 0, &f) < 0 || argint(2, &n) < 0 || argptr(1, &p, n) < 0)
     return -1;
   return filewrite(f, p, n);
@@ -121,6 +124,8 @@ sys_link(void)
   char name[DIRSIZ], *new, *old;
   struct inode *dp, *ip;
 
+  if(!spec_mutation_allowed(myproc()))
+    return -1;
   if(argstr(0, &old) < 0 || argstr(1, &new) < 0)
     return -1;
 
@@ -189,6 +194,8 @@ sys_unlink(void)
   char name[DIRSIZ], *path;
   uint off;
 
+  if(!spec_mutation_allowed(myproc()))
+    return -1;
   if(argstr(0, &path) < 0)
     return -1;
 
@@ -292,6 +299,8 @@ sys_open(void)
 
   if(argstr(0, &path) < 0 || argint(1, &omode) < 0)
     return -1;
+  if((omode & O_CREATE) && !spec_mutation_allowed(myproc()))
+    return -1;
 
   begin_op();
 
@@ -338,6 +347,8 @@ sys_mkdir(void)
   char *path;
   struct inode *ip;
 
+  if(!spec_mutation_allowed(myproc()))
+    return -1;
   begin_op();
   if(argstr(0, &path) < 0 || (ip = create(path, T_DIR, 0, 0)) == 0){
     end_op();
@@ -355,6 +366,8 @@ sys_mknod(void)
   char *path;
   int major, minor;
 
+  if(!spec_mutation_allowed(myproc()))
+    return -1;
   begin_op();
   if((argstr(0, &path)) < 0 ||
      argint(1, &major) < 0 ||

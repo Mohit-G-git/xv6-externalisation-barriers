@@ -6,6 +6,7 @@
 #include "memlayout.h"
 #include "mmu.h"
 #include "proc.h"
+#include "spec.h"
 
 int
 sys_fork(void)
@@ -88,4 +89,22 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+int
+sys_xbegin(void)
+{
+  return spec_begin(myproc());
+}
+
+int
+sys_xcommit(void)
+{
+  return spec_commit(myproc());
+}
+
+int
+sys_xabort(void)
+{
+  return spec_abort(myproc());
 }

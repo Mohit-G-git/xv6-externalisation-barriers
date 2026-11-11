@@ -6,6 +6,7 @@
 #include "x86.h"
 #include "proc.h"
 #include "spinlock.h"
+#include "spec.h"
 
 struct {
   struct spinlock lock;
@@ -88,6 +89,7 @@ allocproc(void)
 found:
   p->state = EMBRYO;
   p->pid = nextpid++;
+  p->spec_id = 0;
 
   release(&ptable.lock);
 
@@ -209,6 +211,7 @@ fork(void)
   np->cwd = idup(curproc->cwd);
 
   safestrcpy(np->name, curproc->name, sizeof(curproc->name));
+  spec_fork_attach(curproc, np);
 
   pid = np->pid;
 
@@ -233,6 +236,8 @@ exit(void)
 
   if(curproc == initproc)
     panic("init exiting");
+
+  spec_proc_exit(curproc);
 
   // Close all open files.
   for(fd = 0; fd < NOFILE; fd++){
@@ -291,6 +296,7 @@ wait(void)
         p->kstack = 0;
         freevm(p->pgdir);
         p->pid = 0;
+        p->spec_id = 0;
         p->parent = 0;
         p->name[0] = 0;
         p->killed = 0;

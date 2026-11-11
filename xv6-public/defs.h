@@ -121,6 +121,15 @@ int             wait(void);
 void            wakeup(void*);
 void            yield(void);
 
+// spec.c
+int             spec_abort(struct proc*);
+int             spec_begin(struct proc*);
+int             spec_commit(struct proc*);
+void            spec_fork_attach(struct proc*, struct proc*);
+int             spec_mutation_allowed(struct proc*);
+void            spec_proc_exit(struct proc*);
+void            specinit(void);
+
 // swtch.S
 void            swtch(struct context**, struct context*);
 
