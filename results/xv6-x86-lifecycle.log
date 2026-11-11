@@ -1,0 +1,21 @@
+Speculation lifecycle smoke test
+-------------------------------
+Command: make CPUS=3 qemu-nox; run `xspec` at the xv6 shell
+QEMU: QEMU emulator version 10.2.4
+Observed output:
+Booting from Hard Disk..xv6...
+cpu0: starting 0
+sb: size 1000 nblocks 941 ninodes 200 nlog 30 logstart 2 inodestart 32 bmap start 58
+init: starting sh
+$ xspec
+xspec output after abort
+XSPEC PASS (lifecycle and fail-closed guard)
+$
+
+The test exercises invalid completion calls, nested-begin rejection, child inheritance, rejection of speculative writes and create/unlink operations, unchanged base-file contents, abort/commit lifecycle, and repeated handle allocation/reclamation. The same test passed with CPUS=1 and CPUS=3.
+
+Existing xv6 regression suite
+-----------------------------
+Command: make CPUS=3 qemu-nox; run `usertests` at the xv6 shell
+Result: `ALL TESTS PASSED`
+The existing suite printed expected guard-page and out-of-memory diagnostics during its `sbrk` and memory-pressure cases; it completed successfully.

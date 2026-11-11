@@ -184,6 +184,7 @@ UPROGS=\
 	_zombie\
 	_mytest\
 	_baseline\
+	_xspec\
 
 fs.img: mkfs README $(UPROGS)
 	./mkfs fs.img README $(UPROGS)
