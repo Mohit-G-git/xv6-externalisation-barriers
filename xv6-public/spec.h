@@ -32,6 +32,7 @@ void spec_op_abort_only(struct spec_op *op);
 void spec_op_leave(struct spec_op *op);
 int spec_file_attach(int spec_id);
 void spec_file_detach(int spec_id);
+int spec_context_visible(int owner_id, int viewer_id);
 enum spec_state spec_context_state(int spec_id);
 
 #endif

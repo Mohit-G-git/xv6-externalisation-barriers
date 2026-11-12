@@ -30,6 +30,7 @@ int             exec(char*, char**);
 struct file*    filealloc(void);
 void            fileclose(struct file*);
 struct file*    filedup(struct file*);
+int             file_context_merge(int, int);
 void            fileinit(void);
 int             fileread(struct file*, char*, int n);
 int             fileread_context(struct file*, char*, int, int);
@@ -52,6 +53,7 @@ void            iunlock(struct inode*);
 void            iunlockput(struct inode*);
 int             iupdate(struct inode*);
 void            fs_spec_discard(int);
+void            fs_spec_merge(int, int);
 void            fs_spec_publish(int);
 void            fs_gate_init(void);
 void            fs_gate_enter(void);
@@ -120,6 +122,7 @@ int             pipewrite(struct pipe*, char*, int);
 void            pipeinit(void);
 void            pipe_output_publish(int);
 void            pipe_output_discard(int);
+void            pipe_output_merge(int, int);
 void            pipe_context_wakeup(int);
 
 //PAGEBREAK: 16
@@ -148,6 +151,8 @@ void            specioinit(void);
 int             spec_console_write(int, const char*, int);
 void            spec_output_publish(int);
 void            spec_output_discard(int);
+int             spec_output_merge_check(int, int);
+int             spec_output_merge(int, int);
 int             shadow_read(int, uint, uint, char*);
 int             shadow_write(int, uint, uint, const char*);
 int             shadow_write_versioned(int, uint, uint, uint,
@@ -166,9 +171,14 @@ int             spec_abort(struct proc*);
 int             spec_begin(struct proc*);
 int             spec_commit(struct proc*);
 void            spec_trace(const char*, int, int, uint, uint, int, int);
-void            spec_cwd_restore(int);
+int             proc_spec_scope_prepare(int, int, int);
+int             proc_spec_scope_reparent(int, int);
+int             proc_spec_scope_abort_outer(int, int);
+void            proc_spec_scope_cwd_finish(int);
+void            proc_spec_stack_cleanup(struct proc*);
 void            spec_fork_attach(struct proc*, struct proc*);
 void            spec_proc_exit(struct proc*);
+int             spec_context_visible(int, int);
 void            specinit(void);
 
 // swtch.S

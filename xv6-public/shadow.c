@@ -72,6 +72,8 @@ static struct {
   uint snapshots[NSPEC];
   uint base_version[NDEV][FSSIZE];
   struct read_entry reads[NSPEC_RESERVATIONS];
+  int scope_id[NSPEC];
+  int parent_id[NSPEC];
 } shadow_table;
 
 static struct {
@@ -79,6 +81,8 @@ static struct {
   struct reservation_entry entry[NSPEC_RESERVATIONS];
   uint next_version;
 } reservations;
+
+static int reservation_find_locked(int, int, uint, uint);
 
 #define SHADOW_TRACE(event, id, dev, block, expected, actual) \
   spec_trace(event, id, -1, dev, block, expected, actual)
@@ -185,6 +189,8 @@ shadowinit(void)
   memset(shadow_table.snapshots, 0, sizeof(shadow_table.snapshots));
   memset(shadow_table.base_version, 0, sizeof(shadow_table.base_version));
   memset(shadow_table.reads, 0, sizeof(shadow_table.reads));
+  memset(shadow_table.scope_id, 0, sizeof(shadow_table.scope_id));
+  memset(shadow_table.parent_id, 0, sizeof(shadow_table.parent_id));
   memset(reservations.entry, 0, sizeof(reservations.entry));
   reservations.next_version = 1;
   for(i = 0; i < NSHADOW_BUCKETS; i++){
@@ -198,6 +204,47 @@ shadowinit(void)
     shadow_table.entry[i].next = i + 1;
   }
   shadow_table.entry[NSHADOW - 1].next = -1;
+}
+
+void
+shadow_set_parent(int spec_id, int parent_id)
+{
+  int slot;
+
+  if((slot = shadow_slot(spec_id)) < 0)
+    return;
+  acquire(&shadow_table.lock);
+  shadow_table.scope_id[slot] = spec_id;
+  shadow_table.parent_id[slot] = parent_id;
+  release(&shadow_table.lock);
+}
+
+static int
+shadow_parent(int spec_id)
+{
+  int slot, parent;
+
+  if((slot = shadow_slot(spec_id)) < 0)
+    return 0;
+  acquire(&shadow_table.lock);
+  parent = shadow_table.scope_id[slot] == spec_id ?
+           shadow_table.parent_id[slot] : 0;
+  release(&shadow_table.lock);
+  return parent;
+}
+
+static int
+shadow_is_ancestor(int ancestor_id, int spec_id)
+{
+  int parent, depth;
+
+  for(depth = 0; depth < NSPEC && spec_id > 0; depth++){
+    parent = shadow_parent(spec_id);
+    if(parent == ancestor_id)
+      return 1;
+    spec_id = parent;
+  }
+  return 0;
 }
 
 // Record the version seen on a transaction's first read.  This is called
@@ -244,7 +291,7 @@ shadow_note_read(int spec_id, uint dev, uint blockno)
 int
 shadow_read(int spec_id, uint dev, uint blockno, char *dst)
 {
-  int index, bucket;
+  int index, bucket, parent;
 
   if(spec_id <= 0 || dst == 0)
     return -1;
@@ -253,6 +300,9 @@ shadow_read(int spec_id, uint dev, uint blockno, char *dst)
   index = shadow_find_locked(spec_id, dev, blockno, 0);
   if(index < 0){
     shadow_bucket_release(bucket);
+    parent = shadow_parent(spec_id);
+    if(parent != 0)
+      return shadow_read(parent, dev, blockno, dst);
     SHADOW_TRACE("block_read", spec_id, dev, blockno, 0, 0);
     return 0;
   }
@@ -441,6 +491,132 @@ shadow_validate_versions(int spec_id)
     }
   }
   release(&shadow_table.lock);
+  return 0;
+}
+
+// Merge a frozen nested overlay into its frozen parent. Both contexts must
+// already have drained operations and been frozen by the lifecycle layer.
+// All bucket locks are held before metadata, matching the ordinary bucket ->
+// metadata lock order. No allocation is needed: duplicate child blocks reuse
+// their slot, while child-only slots are re-keyed into the parent's bucket.
+int
+shadow_merge(int child_id, int parent_id)
+{
+  int i, b, slot, pslot, child_count, parent_count, extra;
+  int parent_index, previous, index, next;
+
+  slot = shadow_slot(child_id);
+  pslot = shadow_slot(parent_id);
+  if(slot < 0 || pslot < 0 || slot == pslot)
+    return -1;
+  for(b = 0; b < NSHADOW_BUCKETS; b++)
+    acquire(&shadow_table.bucket_lock[b]);
+  acquire(&shadow_table.lock);
+  if(shadow_table.frozen_id[slot] != child_id ||
+     shadow_table.frozen_id[pslot] != parent_id ||
+     shadow_table.scope_id[slot] != child_id ||
+     shadow_table.parent_id[slot] != parent_id){
+    release(&shadow_table.lock);
+    for(b = NSHADOW_BUCKETS - 1; b >= 0; b--)
+      release(&shadow_table.bucket_lock[b]);
+    return -1;
+  }
+
+  child_count = shadow_table.spec_count[slot];
+  parent_count = shadow_table.spec_count[pslot];
+  extra = 0;
+  for(i = 0; i < NSHADOW; i++){
+    struct shadow_entry *e = &shadow_table.entry[i];
+    if(e->state == SHADOW_ALLOCATED && e->spec_id == child_id &&
+       shadow_find_locked(parent_id, e->dev, e->blockno, 0) < 0)
+      extra++;
+  }
+  if(parent_count + extra > NSHADOW_QUOTA){
+    release(&shadow_table.lock);
+    for(b = NSHADOW_BUCKETS - 1; b >= 0; b--)
+      release(&shadow_table.bucket_lock[b]);
+    return -1;
+  }
+
+  for(i = 0; i < NSHADOW; i++){
+    struct shadow_entry *e = &shadow_table.entry[i];
+    if(e->state != SHADOW_ALLOCATED || e->spec_id != child_id)
+      continue;
+    b = shadow_hash(child_id, e->dev, e->blockno);
+    previous = -1;
+    index = shadow_table.head[b];
+    while(index >= 0 && index != i){
+      previous = index;
+      index = shadow_table.entry[index].next;
+    }
+    if(index != i)
+      panic("shadow_merge: missing child entry");
+    next = e->next;
+    if(previous < 0)
+      shadow_table.head[b] = next;
+    else
+      shadow_table.entry[previous].next = next;
+
+    parent_index = shadow_find_locked(parent_id, e->dev, e->blockno, 0);
+    if(parent_index >= 0){
+      acquire(&shadow_table.entry[parent_index].data_lock);
+      acquire(&e->data_lock);
+      memmove(shadow_table.entry[parent_index].data, e->data, BSIZE);
+      release(&e->data_lock);
+      release(&shadow_table.entry[parent_index].data_lock);
+      e->state = SHADOW_FREE;
+      e->spec_id = 0;
+      e->next = shadow_table.free_head;
+      shadow_table.free_head = i;
+      shadow_table.spec_count[slot]--;
+      shadow_table.allocated--;
+    } else {
+      e->spec_id = parent_id;
+      b = shadow_hash(parent_id, e->dev, e->blockno);
+      e->next = shadow_table.head[b];
+      shadow_table.head[b] = i;
+      shadow_table.spec_count[slot]--;
+      shadow_table.spec_count[pslot]++;
+    }
+  }
+  for(i = 0; i < NSPEC_RESERVATIONS; i++){
+    struct read_entry *r = &shadow_table.reads[i];
+    if(!r->used || r->spec_id != child_id)
+      continue;
+    for(b = 0; b < NSPEC_RESERVATIONS; b++){
+      struct read_entry *p = &shadow_table.reads[b];
+      if(p->used && p->spec_id == parent_id && p->dev == r->dev &&
+         p->blockno == r->blockno)
+        break;
+    }
+    if(b < NSPEC_RESERVATIONS)
+      r->used = 0;
+    else
+      r->spec_id = parent_id;
+  }
+  shadow_table.frozen_id[slot] = 0;
+  shadow_table.scope_id[slot] = 0;
+  shadow_table.parent_id[slot] = 0;
+  release(&shadow_table.lock);
+  for(b = NSHADOW_BUCKETS - 1; b >= 0; b--)
+    release(&shadow_table.bucket_lock[b]);
+
+  acquire(&reservations.lock);
+  for(i = 0; i < NSPEC_RESERVATIONS; i++){
+    struct reservation_entry *e = &reservations.entry[i];
+    int j;
+    if(!e->used || e->spec_id != child_id)
+      continue;
+    j = reservation_find_locked(parent_id, e->kind, e->dev, e->number);
+    if(j >= 0){
+      reservations.entry[j].state = e->state;
+      reservations.entry[j].version = e->version;
+      memset(e, 0, sizeof(*e));
+    } else
+      e->spec_id = parent_id;
+  }
+  release(&reservations.lock);
+  (void)child_count;
   return 0;
 }
 
@@ -644,6 +820,10 @@ shadow_discard(int spec_id)
   acquire(&shadow_table.lock);
   if(shadow_table.frozen_id[slot] == spec_id)
     shadow_table.frozen_id[slot] = 0;
+  if(shadow_table.scope_id[slot] == spec_id){
+    shadow_table.scope_id[slot] = 0;
+    shadow_table.parent_id[slot] = 0;
+  }
   for(i = 0; i < NSPEC_RESERVATIONS; i++)
     if(shadow_table.reads[i].used && shadow_table.reads[i].spec_id == spec_id)
       memset(&shadow_table.reads[i], 0, sizeof(shadow_table.reads[i]));
@@ -712,7 +892,7 @@ int
 spec_reservation_claim(int spec_id, int kind, uint dev, uint number,
                        int state, struct spec_reservation_token *token)
 {
-  int i, free_slot, previous;
+  int i, free_slot, previous, inherited;
   uint previous_version;
 
   if(token == 0 || spec_id < 0 || (kind != SPEC_RES_INODE &&
@@ -720,6 +900,7 @@ spec_reservation_claim(int spec_id, int kind, uint dev, uint number,
      state != SPEC_RES_DEFERRED_FREE))
     return -1;
   memset(token, 0, sizeof(*token));
+  inherited = 0;
   acquire(&reservations.lock);
   free_slot = -1;
   for(i = 0; i < NSPEC_RESERVATIONS; i++){
@@ -730,14 +911,22 @@ spec_reservation_claim(int spec_id, int kind, uint dev, uint number,
       continue;
     }
     if(e->kind == kind && e->dev == dev && e->number == number){
+      if(e->spec_id == spec_id && spec_id > 0){
+        free_slot = i;
+        break;
+      }
+      if(spec_id > 0 && shadow_is_ancestor(e->spec_id, spec_id)){
+        inherited = 1;
+        continue;
+      }
       if(e->spec_id != spec_id || spec_id == 0){
         release(&reservations.lock);
         return -1;
       }
-      free_slot = i;
-      break;
     }
   }
+  if(inherited && free_slot >= 0 && reservations.entry[free_slot].used)
+    free_slot = -1;
   if(free_slot < 0){
     release(&reservations.lock);
     return -1;
@@ -784,7 +973,9 @@ spec_reservation_check(int spec_id, int kind, uint dev, uint number)
     struct reservation_entry *e = &reservations.entry[i];
     if(e->used && e->kind == kind && e->dev == dev &&
        e->number == number &&
-       (e->spec_id != spec_id || spec_id == 0)){
+       ((e->spec_id != spec_id &&
+         !(spec_id > 0 && shadow_is_ancestor(e->spec_id, spec_id))) ||
+        spec_id == 0)){
       available = 0;
       break;
     }
@@ -796,7 +987,7 @@ spec_reservation_check(int spec_id, int kind, uint dev, uint number)
 int
 spec_reservation_state(int spec_id, int kind, uint dev, uint number)
 {
-  int i, state;
+  int i, state, current, depth;
 
   if(spec_id < 0)
     return -1;
@@ -806,13 +997,23 @@ spec_reservation_state(int spec_id, int kind, uint dev, uint number)
     state = reservations.entry[i].state;
   else {
     state = 0;
-    for(i = 0; i < NSPEC_RESERVATIONS; i++)
-      if(reservations.entry[i].used && reservations.entry[i].kind == kind &&
-         reservations.entry[i].dev == dev &&
-         reservations.entry[i].number == number){
-        state = -1;
+    current = spec_id;
+    for(depth = 0; depth < NSPEC && current > 0 && state == 0; depth++){
+      current = shadow_parent(current);
+      if(current == 0)
         break;
-      }
+      i = reservation_find_locked(current, kind, dev, number);
+      if(i >= 0)
+        state = reservations.entry[i].state;
+    }
+    if(state == 0)
+      for(i = 0; i < NSPEC_RESERVATIONS; i++)
+        if(reservations.entry[i].used && reservations.entry[i].kind == kind &&
+           reservations.entry[i].dev == dev &&
+           reservations.entry[i].number == number){
+          state = -1;
+          break;
+        }
   }
   release(&reservations.lock);
   return state;

@@ -49,12 +49,19 @@ struct proc {
   void *chan;                  // If non-zero, sleeping on chan
   int killed;                  // If non-zero, have been killed
   int spec_id;                 // shared speculation handle; 0 means none
+  int spec_depth;              // active nested-scope depth
+  int spec_id_stack[16];       // enclosing scope at each begin
+  struct inode *spec_cwd_stack[16]; // cwd saved at each begin
+  int spec_transition_id;      // scope whose process transition is pending
+  struct inode *spec_transition_cwd;
+  struct inode *spec_transition_oldcwd;
+  struct inode *spec_transition_savedcwd;
+  int spec_transition_drop_saved;
   int spec_fault;              // speculative filesystem op could not finish safely
   int fs_error;                // filesystem operation hit a reservation/storage failure
   int fs_gate_depth;           // nested filesystem admission scopes
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
-  struct inode *spec_basecwd;  // Current directory saved at xbegin
   char name[16];               // Process name (debugging)
 };
 

@@ -4,6 +4,8 @@
 int spec_console_write(int, const char *, int);
 void spec_output_publish(int);
 void spec_output_discard(int);
+int spec_output_merge_check(int, int);
+int spec_output_merge(int, int);
 void console_output_publish(const char *, int);
 
 #endif

@@ -27,6 +27,9 @@ struct spec_ctx {
   uint generation;
   int abort_only;
   int cleanup_busy;
+  int parent_id;
+  int child_id;
+  uint depth;
 };
 
 static struct {
@@ -110,7 +113,8 @@ spec_reclaim_locked(struct spec_ctx *ctx)
   uint generation;
 
   if(ctx->state == SPEC_ACTIVE || ctx->state == SPEC_COMMITTING ||
-     ctx->proc_refs != 0 || ctx->op_refs != 0 || ctx->file_refs != 0)
+     ctx->proc_refs != 0 || ctx->op_refs != 0 || ctx->file_refs != 0 ||
+     ctx->child_id != 0)
     return;
   generation = ctx->generation + 1;
   if(generation == 0 || generation > SPEC_MAX_GENERATION)
@@ -160,35 +164,56 @@ specinit(void)
 int
 spec_begin(struct proc *p)
 {
-  int i, id;
-  struct spec_ctx *ctx;
-  struct inode *basecwd;
+  int i, id, parent_id, depth;
+  struct spec_ctx *ctx, *parent;
+  struct inode *savedcwd;
 
   acquire(&spectable.lock);
-  if(p->spec_id != 0){
-    ctx = spec_lookup_locked(p->spec_id);
-    if(ctx != 0 && (ctx->state == SPEC_ACTIVE ||
-                    ctx->state == SPEC_COMMITTING)){
+  parent_id = p->spec_id;
+  depth = p->spec_depth;
+  parent = parent_id == 0 ? 0 : spec_lookup_locked(parent_id);
+  if(parent_id != 0 &&
+     (parent == 0 || (parent->state != SPEC_ACTIVE &&
+                      parent->state != SPEC_COMMITTING))){
+    if(parent != 0 && parent->state == SPEC_ABORTED && parent->cleanup_busy){
       release(&spectable.lock);
-      return -1; // nested begin is not supported by this lifecycle layer.
+      return -1;
     }
-    spec_drop_proc_locked(ctx, p); // detach a stale terminal association.
+    spec_drop_proc_locked(parent, p);
+    p->spec_depth = 0;
+    parent_id = 0;
+    depth = 0;
+    parent = 0;
+  }
+  if((parent_id == 0 && depth != 0) ||
+     (parent_id != 0 && (parent == 0 || parent->state != SPEC_ACTIVE ||
+                         parent->child_id != 0)) || depth >= NSPEC){
+    release(&spectable.lock);
+    return -1;
   }
   release(&spectable.lock);
 
-  if(p->spec_basecwd != 0 || p->cwd == 0)
-    panic("spec_begin: cwd state");
-  basecwd = idup(p->cwd);
-  if(basecwd == 0)
+  if(p->cwd == 0 || p->spec_cwd_stack[depth] != 0)
+    return -1;
+  savedcwd = idup(p->cwd);
+  if(savedcwd == 0)
     return -1;
 
   acquire(&spectable.lock);
+  parent = parent_id == 0 ? 0 : spec_lookup_locked(parent_id);
+  if((parent_id != 0 && (parent == 0 || parent->state != SPEC_ACTIVE ||
+                         parent->child_id != 0)) || p->spec_id != parent_id ||
+     p->spec_depth != depth){
+    release(&spectable.lock);
+    spec_release_inode(savedcwd);
+    return -1;
+  }
   for(i = 0; i < NSPEC; i++)
     if(spectable.ctx[i].state == SPEC_FREE)
       break;
   if(i == NSPEC){
     release(&spectable.lock);
-    spec_release_inode(basecwd);
+    spec_release_inode(savedcwd);
     return -1;
   }
 
@@ -205,11 +230,137 @@ spec_begin(struct proc *p)
   ctx->proc_refs = 1;
   ctx->op_refs = 0;
   ctx->file_refs = 0;
-  p->spec_basecwd = basecwd;
+  ctx->parent_id = parent_id;
+  ctx->child_id = 0;
+  ctx->depth = depth;
+  ctx->abort_only = 0;
+  ctx->cleanup_busy = 0;
+  if(parent != 0){
+    parent->child_id = id;
+    if(parent->proc_refs == 0)
+      panic("spec_begin parent refs");
+    parent->proc_refs--;
+  }
+  p->spec_id_stack[depth] = parent_id;
+  p->spec_cwd_stack[depth] = savedcwd;
+  p->spec_depth = depth + 1;
   p->spec_id = id;
   release(&spectable.lock);
+  shadow_set_parent(id, parent_id);
   SPEC_TRACE("begin", id, p->pid, 0, 0, 0, 0);
   return id;
+}
+
+static int
+spec_commit_nested(struct proc *p, int id, int parent_id)
+{
+  struct spec_ctx *ctx, *parent;
+  int moved_procs, moved_files;
+
+  SPEC_TRACE("nested_commit_begin", id, p->pid, 0, 0, 0, 0);
+  pipe_context_wakeup(id);
+  pipe_context_wakeup(parent_id);
+  acquire(&spectable.lock);
+  ctx = spec_lookup_locked(id);
+  parent = spec_lookup_locked(parent_id);
+  while(ctx != 0 && parent != 0 &&
+        (ctx->op_refs != 0 || parent->op_refs != 0)){
+    if(ctx->op_refs != 0)
+      sleep(ctx, &spectable.lock);
+    else
+      sleep(parent, &spectable.lock);
+    ctx = spec_lookup_locked(id);
+    parent = spec_lookup_locked(parent_id);
+  }
+  if(ctx == 0 || parent == 0 || ctx->state != SPEC_COMMITTING ||
+     parent->state != SPEC_COMMITTING || ctx->abort_only ||
+     parent->child_id != id){
+    if(ctx != 0 && ctx->state == SPEC_COMMITTING)
+      ctx->state = SPEC_ACTIVE;
+    if(parent != 0 && parent->state == SPEC_COMMITTING)
+      parent->state = SPEC_ACTIVE;
+    if(ctx != 0)
+      wakeup(ctx);
+    if(parent != 0)
+      wakeup(parent);
+    release(&spectable.lock);
+    return -1;
+  }
+  release(&spectable.lock);
+
+  if(shadow_freeze(parent_id) < 0)
+    goto retry;
+  if(shadow_freeze(id) < 0){
+    if(shadow_thaw(parent_id) < 0)
+      panic("nested commit parent thaw");
+    goto retry;
+  }
+  if(shadow_validate(parent_id) < 0 || shadow_validate(id) < 0 ||
+     spec_output_merge_check(id, parent_id) < 0 ||
+     shadow_merge(id, parent_id) < 0){
+    if(shadow_thaw(id) < 0 || shadow_thaw(parent_id) < 0)
+      panic("nested commit validation thaw");
+    goto retry;
+  }
+  if(spec_output_merge(id, parent_id) < 0)
+    panic("nested commit output merge");
+  fs_spec_merge(id, parent_id);
+  if(proc_spec_scope_prepare(id, parent_id, 1) < 0)
+    panic("nested commit process prepare");
+  moved_files = file_context_merge(id, parent_id);
+  if(shadow_thaw(parent_id) < 0)
+    panic("nested commit parent thaw");
+  proc_spec_scope_cwd_finish(id);
+
+  acquire(&spectable.lock);
+  ctx = spec_lookup_locked(id);
+  parent = spec_lookup_locked(parent_id);
+  if(ctx == 0 || parent == 0 || ctx->state != SPEC_COMMITTING ||
+     parent->state != SPEC_COMMITTING || parent->child_id != id){
+    release(&spectable.lock);
+    panic("nested commit state changed");
+  }
+  moved_procs = proc_spec_scope_reparent(id, parent_id);
+  if(moved_procs != (int)ctx->proc_refs || moved_files != (int)ctx->file_refs)
+    panic("nested commit references");
+  parent->proc_refs += moved_procs;
+  parent->file_refs += moved_files;
+  ctx->proc_refs = 0;
+  ctx->file_refs = 0;
+  parent->child_id = 0;
+  ctx->parent_id = 0;
+  ctx->state = SPEC_COMMITTED;
+  release(&spectable.lock);
+
+  acquire(&spectable.lock);
+  ctx = spec_lookup_locked(id);
+  parent = spec_lookup_locked(parent_id);
+  if(parent == 0 || parent->state != SPEC_COMMITTING)
+    panic("nested commit parent state");
+  parent->state = SPEC_ACTIVE;
+  wakeup(parent);
+  if(ctx != 0){
+    wakeup(ctx);
+    spec_reclaim_locked(ctx);
+  }
+  release(&spectable.lock);
+  SPEC_TRACE("nested_commit_done", id, p->pid, 0, 0, 0, 0);
+  return 0;
+
+retry:
+  acquire(&spectable.lock);
+  ctx = spec_lookup_locked(id);
+  parent = spec_lookup_locked(parent_id);
+  if(ctx != 0 && ctx->state == SPEC_COMMITTING)
+    ctx->state = SPEC_ACTIVE;
+  if(parent != 0 && parent->state == SPEC_COMMITTING)
+    parent->state = SPEC_ACTIVE;
+  if(ctx != 0)
+    wakeup(ctx);
+  if(parent != 0)
+    wakeup(parent);
+  release(&spectable.lock);
+  return -1;
 }
 
 int
@@ -219,22 +370,36 @@ spec_commit(struct proc *p)
   int id = 0;
   int result = -1;
   int nblocks;
-  int next, seen;
+  int next, seen, moved;
   uint epoch;
   struct shadow_snapshot snapshot;
   struct shadow_block block;
+  int parent_id = 0;
 
   acquire(&spectable.lock);
   ctx = spec_lookup_locked(p->spec_id);
   if(ctx != 0 && ctx->state == SPEC_ACTIVE && ctx->owner == p->pid &&
-     !ctx->abort_only){
+     !ctx->abort_only && ctx->child_id == 0){
     ctx->state = SPEC_COMMITTING;
     id = ctx->id;
+    parent_id = ctx->parent_id;
+    if(parent_id != 0){
+      struct spec_ctx *parent = spec_lookup_locked(parent_id);
+      if(parent == 0 || parent->state != SPEC_ACTIVE ||
+         parent->child_id != id){
+        ctx->state = SPEC_ACTIVE;
+        release(&spectable.lock);
+        return -1;
+      }
+      parent->state = SPEC_COMMITTING;
+    }
     result = 1;
   }
   release(&spectable.lock);
 
   if(result == 1){
+    if(parent_id != 0)
+      return spec_commit_nested(p, id, parent_id);
     SPEC_TRACE("commit_begin", id, p->pid, 0, 0, 0, 0);
     // A speculative pipe reader can otherwise sleep indefinitely while its
     // operation reference prevents this commit from draining.
@@ -373,71 +538,116 @@ spec_commit(struct proc *p)
     shadow_discard(id);
     spec_output_publish(id);
     fs_gate_publish_end();
-    spec_cwd_restore(id);
+    if(proc_spec_scope_prepare(id, 0, 0) <= 0)
+      panic("spec_commit process prepare");
+    proc_spec_scope_cwd_finish(id);
     acquire(&spectable.lock);
     ctx = spec_lookup_locked(id);
     if(ctx == 0 || ctx->state != SPEC_COMMITTING){
       release(&spectable.lock);
       panic("spec_commit: state changed");
     }
+    moved = proc_spec_scope_reparent(id, 0);
+    if(moved != (int)ctx->proc_refs)
+      panic("spec_commit process references");
+    ctx->proc_refs = 0;
     ctx->state = SPEC_COMMITTED;
     wakeup(ctx);
     release(&spectable.lock);
     SPEC_TRACE("commit_done", id, p->pid, 0, 0, 0, 0);
-    acquire(&spectable.lock);
-    ctx = spec_lookup_locked(id);
-    spec_drop_proc_locked(ctx, p);
-    release(&spectable.lock);
     result = 0;
   }
   return result;
 }
 
+static void
+spec_abort_context(int id, int parent_id)
+{
+  struct spec_ctx *ctx;
+  struct spec_ctx *parent;
+  int moved;
+
+  SPEC_TRACE("abort", id, -1, 0, 0, 0, 0);
+  pipe_context_wakeup(id);
+  acquire(&spectable.lock);
+  ctx = spec_lookup_locked(id);
+  while(ctx != 0 && ctx->op_refs != 0){
+    sleep(ctx, &spectable.lock);
+    ctx = spec_lookup_locked(id);
+  }
+  release(&spectable.lock);
+
+  fs_spec_discard(id);
+  shadow_discard(id);
+  spec_output_discard(id);
+  if(proc_spec_scope_prepare(id, parent_id, 0) <= 0)
+    panic("spec_abort process prepare");
+  proc_spec_scope_cwd_finish(id);
+
+  acquire(&spectable.lock);
+  ctx = spec_lookup_locked(id);
+  parent = parent_id == 0 ? 0 : spec_lookup_locked(parent_id);
+  if(ctx == 0 || ctx->state != SPEC_ABORTED || !ctx->cleanup_busy ||
+     (parent_id != 0 && (parent == 0 || parent->child_id != id)))
+    panic("spec_abort state");
+  if(parent_id == 0){
+    moved = proc_spec_scope_abort_outer(id, myproc()->pid);
+    if(moved != 1 || ctx->proc_refs < (uint)moved)
+      panic("spec_abort owner references");
+    ctx->proc_refs -= moved;
+  } else {
+    moved = proc_spec_scope_reparent(id, parent_id);
+    if(moved != (int)ctx->proc_refs)
+      panic("spec_abort process references");
+    ctx->proc_refs = 0;
+  }
+  if(parent != 0){
+    parent->proc_refs += moved;
+    parent->child_id = 0;
+  }
+  ctx->parent_id = 0;
+  ctx->cleanup_busy = 0;
+  wakeup(ctx);
+  if(parent != 0)
+    wakeup(parent);
+  spec_reclaim_locked(ctx);
+  release(&spectable.lock);
+  SPEC_TRACE("cleanup", id, -1, 0, 0, 0, 0);
+}
+
 int
 spec_abort(struct proc *p)
 {
-  struct spec_ctx *ctx;
-  int id = 0;
-  int result = -1;
+  struct spec_ctx *ctx, *parent;
+  int id, parent_id;
 
   acquire(&spectable.lock);
   ctx = spec_lookup_locked(p->spec_id);
-  if(ctx != 0 && ctx->state == SPEC_ACTIVE && ctx->owner == p->pid){
-    ctx->state = SPEC_ABORTED;
-    ctx->cleanup_busy = 1;
-    id = ctx->id;
-    result = 0;
+  if(ctx == 0 || ctx->state != SPEC_ACTIVE || ctx->owner != p->pid ||
+     ctx->child_id != 0){
+    release(&spectable.lock);
+    return -1;
   }
+  parent_id = ctx->parent_id;
+  parent = parent_id == 0 ? 0 : spec_lookup_locked(parent_id);
+  if(parent_id != 0 && (parent == 0 || parent->state != SPEC_ACTIVE ||
+                        parent->child_id != ctx->id)){
+    release(&spectable.lock);
+    return -1;
+  }
+  id = ctx->id;
+  ctx->state = SPEC_ABORTED;
+  ctx->cleanup_busy = 1;
   release(&spectable.lock);
-  if(result == 0){
-    SPEC_TRACE("abort", id, p->pid, 0, 0, 0, 0);
-    pipe_context_wakeup(id);
-    acquire(&spectable.lock);
-    ctx = spec_lookup_locked(id);
-    while(ctx != 0 && ctx->op_refs != 0)
-      sleep(ctx, &spectable.lock);
-    release(&spectable.lock);
-    fs_spec_discard(id);
-    spec_cwd_restore(id);
-    shadow_discard(id);
-    spec_output_discard(id);
-    SPEC_TRACE("cleanup", id, p->pid, 0, 0, 0, 0);
-    acquire(&spectable.lock);
-    ctx = spec_lookup_locked(id);
-    if(ctx != 0){
-      ctx->cleanup_busy = 0;
-      wakeup(ctx);
-    }
-    spec_drop_proc_locked(ctx, p);
-    release(&spectable.lock);
-  }
-  return result;
+  spec_abort_context(id, parent_id);
+  return 0;
 }
 
 void
 spec_fork_attach(struct proc *parent, struct proc *child)
 {
   struct spec_ctx *ctx;
+  int i;
 
   child->spec_id = 0;
   if(parent->spec_id == 0)
@@ -454,51 +664,74 @@ spec_fork_attach(struct proc *parent, struct proc *child)
     spec_drop_proc_locked(ctx, parent);
   }
   release(&spectable.lock);
-  if(child->spec_id != 0)
+  if(child->spec_id != 0){
+    child->spec_depth = parent->spec_depth;
+    for(i = 0; i < parent->spec_depth; i++){
+      child->spec_id_stack[i] = parent->spec_id_stack[i];
+      child->spec_cwd_stack[i] = idup(parent->spec_cwd_stack[i]);
+      if(child->spec_cwd_stack[i] == 0)
+        panic("spec_fork_attach cwd");
+    }
     SPEC_TRACE("fork_attach", child->spec_id, child->pid, 0, 0, 0, 0);
+  }
 }
 
 void
 spec_proc_exit(struct proc *p)
 {
   struct spec_ctx *ctx;
-  int id = 0;
-  int aborted = 0;
+  int id, parent_id, child_id, owner;
 
-  acquire(&spectable.lock);
-  ctx = spec_lookup_locked(p->spec_id);
-  if(ctx != 0 && ctx->state == SPEC_ACTIVE && ctx->owner == p->pid){
-    ctx->state = SPEC_ABORTED; // owner death aborts the shared context.
-    ctx->cleanup_busy = 1;
-    id = ctx->id;
-    aborted = 1;
-  }
-  release(&spectable.lock);
-  if(aborted){
-    SPEC_TRACE("owner_exit_abort", id, p->pid, 0, 0, 0, 0);
-    pipe_context_wakeup(id);
+  while(p->spec_id != 0){
     acquire(&spectable.lock);
-    ctx = spec_lookup_locked(id);
-    while(ctx != 0 && ctx->op_refs != 0)
+    ctx = spec_lookup_locked(p->spec_id);
+    if(ctx == 0){
+      spec_drop_proc_locked(0, p);
+      release(&spectable.lock);
+      break;
+    }
+    if(ctx->state == SPEC_COMMITTING ||
+       (ctx->state == SPEC_ABORTED && ctx->cleanup_busy)){
       sleep(ctx, &spectable.lock);
+      release(&spectable.lock);
+      continue;
+    }
+    child_id = ctx->child_id;
+    owner = ctx->owner == p->pid;
+    if(ctx->state == SPEC_ACTIVE && !owner){
+      spec_drop_proc_locked(ctx, p);
+      release(&spectable.lock);
+      break;
+    }
+    if(child_id != 0){
+      struct spec_ctx *child = spec_lookup_locked(child_id);
+      if(child != 0 && child->state == SPEC_ACTIVE){
+        id = ctx->id;
+        child->state = SPEC_ABORTED;
+        child->cleanup_busy = 1;
+        release(&spectable.lock);
+        SPEC_TRACE("owner_exit_nested_abort", child_id, p->pid, 0, 0, 0, 0);
+        spec_abort_context(child_id, id);
+        continue;
+      }
+      sleep(ctx, &spectable.lock);
+      release(&spectable.lock);
+      continue;
+    }
+    id = ctx->id;
+    parent_id = ctx->parent_id;
+    if(ctx->state == SPEC_ACTIVE && owner){
+      ctx->state = SPEC_ABORTED;
+      ctx->cleanup_busy = 1;
+      release(&spectable.lock);
+      SPEC_TRACE("owner_exit_abort", id, p->pid, 0, 0, 0, 0);
+      spec_abort_context(id, parent_id);
+      continue;
+    }
+    spec_drop_proc_locked(ctx, p);
     release(&spectable.lock);
-    fs_spec_discard(id);
-    spec_cwd_restore(id);
-    shadow_discard(id);
-    spec_output_discard(id);
-    SPEC_TRACE("cleanup", id, p->pid, 0, 0, 0, 0);
+    break;
   }
-  acquire(&spectable.lock);
-  ctx = spec_lookup_locked(p->spec_id);
-  while(!aborted && ctx != 0 && ctx->state == SPEC_ABORTED &&
-        ctx->cleanup_busy)
-    sleep(ctx, &spectable.lock);
-  if(aborted && ctx != 0){
-    ctx->cleanup_busy = 0;
-    wakeup(ctx);
-  }
-  spec_drop_proc_locked(ctx, p);
-  release(&spectable.lock);
 }
 
 int
@@ -659,4 +892,29 @@ spec_context_state(int spec_id)
   state = ctx == 0 ? SPEC_FREE : ctx->state;
   release(&spectable.lock);
   return state;
+}
+
+int
+spec_context_visible(int owner_id, int viewer_id)
+{
+  struct spec_ctx *ctx;
+  int current, depth, visible;
+
+  if(owner_id <= 0 || viewer_id <= 0)
+    return 0;
+  acquire(&spectable.lock);
+  current = viewer_id;
+  visible = 0;
+  for(depth = 0; depth < NSPEC && current > 0; depth++){
+    if(current == owner_id){
+      visible = 1;
+      break;
+    }
+    ctx = spec_lookup_locked(current);
+    if(ctx == 0)
+      break;
+    current = ctx->parent_id;
+  }
+  release(&spectable.lock);
+  return visible;
 }

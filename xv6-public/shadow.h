@@ -59,6 +59,8 @@ uint shadow_base_version(uint dev, uint blockno);
 int shadow_note_read(int spec_id, uint dev, uint blockno);
 void shadow_note_base_write(uint dev, uint blockno);
 int shadow_validate_versions(int spec_id);
+void shadow_set_parent(int spec_id, int parent_id);
+int shadow_merge(int child_id, int parent_id);
 int shadow_freeze(int spec_id);
 int shadow_thaw(int spec_id);
 int shadow_snapshot_begin(int spec_id, struct shadow_snapshot *snap);

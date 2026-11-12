@@ -87,3 +87,60 @@ spec_output_discard(int id)
   release(&output.lock);
   pipe_output_discard(id);
 }
+
+int
+spec_output_merge_check(int child_id, int parent_id)
+{
+  int child, parent, i, result;
+
+  acquire(&output.lock);
+  child = parent = -1;
+  for(i = 0; i < NELEM(output.id); i++){
+    if(output.id[i] == child_id)
+      child = i;
+    if(output.id[i] == parent_id)
+      parent = i;
+  }
+  result = child < 0 || parent < 0 ||
+           output.len[child] + output.len[parent] <= SPEC_CONSOLE_CAP;
+  release(&output.lock);
+  return result ? 0 : -1;
+}
+
+int
+spec_output_merge(int child_id, int parent_id)
+{
+  int child, parent, i;
+
+  acquire(&output.lock);
+  child = parent = -1;
+  for(i = 0; i < NELEM(output.id); i++){
+    if(output.id[i] == child_id)
+      child = i;
+    if(output.id[i] == parent_id)
+      parent = i;
+  }
+  if(child < 0){
+    release(&output.lock);
+    pipe_output_merge(child_id, parent_id);
+    return 0;
+  }
+  if(parent < 0){
+    output.id[child] = parent_id;
+    release(&output.lock);
+    pipe_output_merge(child_id, parent_id);
+    return 0;
+  }
+  if(output.len[parent] + output.len[child] > SPEC_CONSOLE_CAP){
+    release(&output.lock);
+    return -1;
+  }
+  memmove(output.data[parent] + output.len[parent], output.data[child],
+          output.len[child]);
+  output.len[parent] += output.len[child];
+  output.id[child] = 0;
+  output.len[child] = 0;
+  release(&output.lock);
+  pipe_output_merge(child_id, parent_id);
+  return 0;
+}

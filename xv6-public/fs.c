@@ -675,6 +675,34 @@ fs_spec_publish(int spec_id)
   }
 }
 
+// Retire the nested inode-cache view after its block overlay has been merged.
+// Parent views must reload metadata from the now-merged parent shadow map.
+void
+fs_spec_merge(int child_id, int parent_id)
+{
+  struct inode *ip;
+  int i;
+
+  fs_spec_discard(child_id);
+  for(i = 0; i < NINODE; i++){
+    ip = &icache.inode[i];
+    acquire(&icache.lock);
+    if(ip->ref > 0 && ip->spec_id == parent_id)
+      ip->ref++;
+    else
+      ip = 0;
+    release(&icache.lock);
+    if(ip != 0){
+      acquiresleep(&ip->lock);
+      ip->valid = 0;
+      releasesleep(&ip->lock);
+      acquire(&icache.lock);
+      ip->ref--;
+      release(&icache.lock);
+    }
+  }
+}
+
 // Increment reference count for ip.
 // Returns ip to enable ip = idup(ip1) idiom.
 struct inode*

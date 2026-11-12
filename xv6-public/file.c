@@ -86,10 +86,31 @@ fileclose(struct file *f)
     spec_file_detach(ff.spec_id);
 }
 
+// Retag open file objects when a nested context merges into its parent.
+// file_refs count allocated file objects, not descriptor duplicates.
+int
+file_context_merge(int from_id, int to_id)
+{
+  struct file *f;
+  int moved;
+
+  moved = 0;
+  acquire(&ftable.lock);
+  for(f = ftable.file; f < ftable.file + NFILE; f++)
+    if(f->ref > 0 && f->spec_id == from_id){
+      f->spec_id = to_id;
+      moved++;
+    }
+  release(&ftable.lock);
+  return moved;
+}
+
 static int
 file_context_valid(struct file *f, int spec_id)
 {
   if(f->spec_id == 0 || f->spec_id == spec_id)
+    return 1;
+  if(spec_context_visible(f->spec_id, spec_id))
     return 1;
   // Empty-context commits may detach a handle into the identical base view.
   // Aborted or still-active handles cannot be used from another context.

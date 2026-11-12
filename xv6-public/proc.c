@@ -8,6 +8,8 @@
 #include "spinlock.h"
 #include "spec.h"
 #include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
 
 struct {
   struct spinlock lock;
@@ -91,10 +93,17 @@ found:
   p->state = EMBRYO;
   p->pid = nextpid++;
   p->spec_id = 0;
+  p->spec_depth = 0;
+  memset(p->spec_id_stack, 0, sizeof(p->spec_id_stack));
+  memset(p->spec_cwd_stack, 0, sizeof(p->spec_cwd_stack));
+  p->spec_transition_id = 0;
+  p->spec_transition_cwd = 0;
+  p->spec_transition_oldcwd = 0;
+  p->spec_transition_savedcwd = 0;
+  p->spec_transition_drop_saved = 0;
   p->spec_fault = 0;
   p->fs_error = 0;
   p->fs_gate_depth = 0;
-  p->spec_basecwd = 0;
 
   release(&ptable.lock);
 
@@ -217,11 +226,6 @@ fork(void)
 
   safestrcpy(np->name, curproc->name, sizeof(curproc->name));
   spec_fork_attach(curproc, np);
-  if(np->spec_id != 0){
-    if(curproc->spec_basecwd == 0)
-      panic("fork: missing speculative cwd");
-    np->spec_basecwd = idup(curproc->spec_basecwd);
-  }
 
   pid = np->pid;
 
@@ -234,31 +238,150 @@ fork(void)
   return pid;
 }
 
-// Current directories are process-local references, not disk blocks. Restore
-// each member to its xbegin directory before private inode views are retired.
-void
-spec_cwd_restore(int spec_id)
+// Prepare process-local cwd changes while the speculation contexts are
+// frozen. The lifecycle layer keeps the context state non-active until it has
+// atomically reparented process membership and released the old references.
+int
+proc_spec_scope_prepare(int spec_id, int parent_id, int merge)
 {
-  int i;
+  struct proc *members[NPROC];
   struct proc *p;
-  struct inode *oldcwd;
+  struct inode *oldcwd, *savedcwd, *newcwd;
+  int i, n;
+
+  n = 0;
+  acquire(&ptable.lock);
+  for(i = 0; i < NPROC; i++){
+    p = &ptable.proc[i];
+    if(p->state == UNUSED || p->spec_id != spec_id)
+      continue;
+    if(p->spec_depth <= 0 || p->spec_transition_id != 0)
+      panic("spec_scope_prepare state");
+    p->spec_transition_id = spec_id;
+    p->spec_transition_oldcwd = p->cwd;
+    p->spec_transition_savedcwd = p->spec_cwd_stack[p->spec_depth - 1];
+    p->spec_transition_drop_saved = parent_id > 0 && merge;
+    p->spec_transition_cwd = 0;
+    members[n++] = p;
+  }
+  release(&ptable.lock);
+
+  for(i = 0; i < n; i++){
+    p = members[i];
+    oldcwd = p->spec_transition_oldcwd;
+    savedcwd = p->spec_transition_savedcwd;
+    if(oldcwd == 0 || savedcwd == 0)
+      panic("spec_scope_prepare cwd");
+    if(parent_id > 0 && merge){
+      newcwd = iget_context(oldcwd->dev, oldcwd->inum, parent_id);
+      if(newcwd == 0)
+        panic("spec_scope_prepare rebase");
+    } else
+      newcwd = savedcwd;
+    acquire(&ptable.lock);
+    if(p->spec_transition_id != spec_id){
+      release(&ptable.lock);
+      panic("spec_scope_prepare raced");
+    }
+    p->spec_transition_cwd = newcwd;
+    release(&ptable.lock);
+  }
+  return n;
+}
+
+// Caller holds the speculation registry lock, preventing exit/fork reference
+// changes while process IDs and their context reference counts are updated.
+int
+proc_spec_scope_reparent(int spec_id, int parent_id)
+{
+  struct proc *p;
+  int i, n;
+
+  n = 0;
+  acquire(&ptable.lock);
+  for(i = 0; i < NPROC; i++){
+    p = &ptable.proc[i];
+    if(p->state == UNUSED || p->spec_id != spec_id)
+      continue;
+    if(p->spec_depth <= 0 ||
+       p->spec_id_stack[p->spec_depth - 1] != parent_id)
+      panic("spec_scope_reparent state");
+    p->spec_id = parent_id;
+    p->spec_id_stack[p->spec_depth - 1] = 0;
+    p->spec_cwd_stack[p->spec_depth - 1] = 0;
+    p->spec_depth--;
+    n++;
+  }
+  release(&ptable.lock);
+  return n;
+}
+
+// On outer abort, detach the owner that requested the abort but keep forked
+// participants associated with the aborted context. Their syscalls remain
+// blocked until they explicitly start a new speculation or exit.
+int
+proc_spec_scope_abort_outer(int spec_id, int owner_pid)
+{
+  struct proc *p;
+  int i, detached;
+
+  detached = 0;
+  acquire(&ptable.lock);
+  for(i = 0; i < NPROC; i++){
+    p = &ptable.proc[i];
+    if(p->state == UNUSED || p->spec_id != spec_id)
+      continue;
+    if(p->spec_depth != 1 || p->spec_id_stack[0] != 0 ||
+       p->spec_cwd_stack[0] == 0)
+      panic("spec_scope_abort_outer state");
+    p->spec_id_stack[0] = 0;
+    p->spec_cwd_stack[0] = 0;
+    p->spec_depth = 0;
+    if(p->pid == owner_pid){
+      p->spec_id = 0;
+      detached++;
+    }
+  }
+  release(&ptable.lock);
+  return detached;
+}
+
+void
+proc_spec_scope_cwd_finish(int spec_id)
+{
+  struct proc *p;
+  struct inode *oldcwd, *savedcwd;
+  int i, drop_saved;
 
   for(i = 0; i < NPROC; i++){
     acquire(&ptable.lock);
     p = &ptable.proc[i];
-    if(p->state == UNUSED || p->spec_id != spec_id ||
-       p->cwd == 0 || p->spec_basecwd == 0){
+    if(p->state == UNUSED || p->spec_transition_id != spec_id){
       release(&ptable.lock);
       continue;
     }
-    oldcwd = p->cwd;
-    p->cwd = p->spec_basecwd;
-    p->spec_basecwd = 0;
+    oldcwd = p->spec_transition_oldcwd;
+    savedcwd = p->spec_transition_savedcwd;
+    drop_saved = p->spec_transition_drop_saved;
+    if(p->spec_transition_cwd == 0)
+      panic("spec_scope_cwd_finish state");
+    p->cwd = p->spec_transition_cwd;
+    p->spec_transition_id = 0;
+    p->spec_transition_oldcwd = 0;
+    p->spec_transition_savedcwd = 0;
+    p->spec_transition_cwd = 0;
+    p->spec_transition_drop_saved = 0;
     release(&ptable.lock);
-
-    begin_op();
-    iput(oldcwd);
-    end_op();
+    if(oldcwd != 0){
+      begin_op();
+      iput(oldcwd);
+      end_op();
+    }
+    if(savedcwd != 0 && drop_saved){
+      begin_op();
+      iput(savedcwd);
+      end_op();
+    }
   }
 }
 
@@ -293,22 +416,15 @@ exit(void)
     }
   }
 
+  if(exitref)
+    spec_op_leave(&exitop);
+  spec_proc_exit(curproc);
+  proc_spec_stack_cleanup(curproc);
+
   begin_op();
   iput(curproc->cwd);
   end_op();
   curproc->cwd = 0;
-
-  if(exitref){
-    spec_op_leave(&exitop);
-    spec_proc_exit(curproc);
-  }
-
-  if(curproc->spec_basecwd){
-    begin_op();
-    iput(curproc->spec_basecwd);
-    end_op();
-    curproc->spec_basecwd = 0;
-  }
 
   acquire(&ptable.lock);
 
@@ -328,6 +444,29 @@ exit(void)
   curproc->state = ZOMBIE;
   sched();
   panic("zombie exit");
+}
+
+void
+proc_spec_stack_cleanup(struct proc *p)
+{
+  struct inode *saved[16];
+  int i, depth;
+
+  depth = p->spec_depth;
+  if(depth < 0 || depth > 16)
+    panic("spec stack depth");
+  for(i = 0; i < depth; i++){
+    saved[i] = p->spec_cwd_stack[i];
+    p->spec_cwd_stack[i] = 0;
+    p->spec_id_stack[i] = 0;
+  }
+  p->spec_depth = 0;
+  for(i = 0; i < depth; i++)
+    if(saved[i] != 0){
+      begin_op();
+      iput(saved[i]);
+      end_op();
+    }
 }
 
 // Wait for a child process to exit and return its pid.
@@ -355,7 +494,6 @@ wait(void)
         freevm(p->pgdir);
         p->pid = 0;
         p->spec_id = 0;
-        p->spec_basecwd = 0;
         p->parent = 0;
         p->name[0] = 0;
         p->killed = 0;

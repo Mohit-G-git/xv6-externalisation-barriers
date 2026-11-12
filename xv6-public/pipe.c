@@ -229,6 +229,24 @@ pipe_output_discard(int specid)
   pipe_spec_finish(specid, 0);
 }
 
+void
+pipe_output_merge(int childid, int parentid)
+{
+  struct pipe *p;
+  uint pos;
+
+  acquire(&pipes.lock);
+  for(p = pipes.head; p; p = p->next){
+    acquire(&p->lock);
+    for(pos = p->nread; pos != p->nwrite; pos++)
+      if(p->spec[pos % PIPESIZE] == childid)
+        p->spec[pos % PIPESIZE] = parentid;
+    wakeup(&p->nread);
+    release(&p->lock);
+  }
+  release(&pipes.lock);
+}
+
 // Wake potentially blocked speculative readers before commit/abort drains
 // their operation references. Readers recheck their context after waking.
 void
