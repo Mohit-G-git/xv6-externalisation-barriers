@@ -65,6 +65,12 @@ OBJCOPY = $(TOOLPREFIX)objcopy
 OBJDUMP = $(TOOLPREFIX)objdump
 CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
 CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
+ifeq ($(SPEC_DEBUG),1)
+CFLAGS += -DSPEC_DEBUG
+endif
+ifneq ($(SPEC_CRASH_POINT),)
+CFLAGS += -DSPEC_CRASH_POINT=$(SPEC_CRASH_POINT)
+endif
 ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
 # FreeBSD ld wants ``elf_i386_fbsd''
 LDFLAGS += -m $(shell $(LD) -V | grep elf_i386 2>/dev/null | head -n 1)
@@ -172,6 +178,7 @@ UPROGS=\
 	_baseline\
 	_xspec\
 	_xio\
+	_xcrash\
 
 fs.img: mkfs README $(UPROGS)
 	./mkfs fs.img README $(UPROGS)
@@ -223,6 +230,12 @@ qemu-memfs: check-qemu xv6memfs.img
 
 qemu-nox: check-qemu fs.img xv6.img
 	$(QEMU) -nographic $(QEMUOPTS)
+
+test-qemu: check-qemu fs.img xv6.img
+	expect ../tests/qemu-tests.exp "$(QEMU)" xv6.img fs.img
+
+crash-test: check-qemu
+	../tests/crash-recovery.sh "$(QEMU)"
 
 .gdbinit: .gdbinit.tmpl
 	sed "s/localhost:1234/localhost:$(GDBPORT)/" < $^ > $@
@@ -277,4 +290,4 @@ tar:
 	cp dist/* dist/.gdbinit.tmpl /tmp/xv6
 	(cd /tmp; tar cf - xv6) | gzip >xv6-rev10.tar.gz  # the next one will be 10 (9/17)
 
-.PHONY: dist-test dist
+.PHONY: dist-test dist test-qemu crash-test

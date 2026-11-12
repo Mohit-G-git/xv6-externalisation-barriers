@@ -1,0 +1,42 @@
+#!/usr/bin/expect -f
+
+if {$argc != 5} {
+  puts stderr "usage: recovery-check.exp QEMU KERNEL_IMAGE FS_IMAGE MODE MARKER"
+  exit 2
+}
+
+set qemu [lindex $argv 0]
+set kernel [lindex $argv 1]
+set fs [lindex $argv 2]
+set mode [lindex $argv 3]
+set marker [lindex $argv 4]
+set timeout 60
+
+spawn $qemu -nographic \
+  -drive file=$fs,index=1,media=disk,format=raw \
+  -drive file=$kernel,index=0,media=disk,format=raw \
+  -smp 1 -m 512
+expect {
+  "init: starting sh" {}
+  timeout { puts stderr "QEMU boot timed out during recovery check"; exit 1 }
+  eof { puts stderr "QEMU exited during recovery boot"; exit 1 }
+}
+send -- "xcrash $mode\r"
+expect {
+  -exact $marker { puts "PASS $marker" }
+  -re {XCRASH FAIL|panic:} {
+    puts stderr "Guest reported failed recovery validation"
+    exit 1
+  }
+  timeout {
+    puts stderr "Timed out waiting for recovery result '$marker'"
+    exit 1
+  }
+  eof {
+    puts stderr "QEMU exited before recovery validation"
+    exit 1
+  }
+}
+send -- "\001x"
+expect eof
+wait

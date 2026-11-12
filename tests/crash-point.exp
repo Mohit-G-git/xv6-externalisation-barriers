@@ -1,0 +1,47 @@
+#!/usr/bin/expect -f
+
+if {$argc != 4} {
+  puts stderr "usage: crash-point.exp QEMU KERNEL_IMAGE FS_IMAGE POINT"
+  exit 2
+}
+
+set qemu [lindex $argv 0]
+set kernel [lindex $argv 1]
+set fs [lindex $argv 2]
+set point [lindex $argv 3]
+set timeout 60
+
+spawn $qemu -nographic \
+  -drive file=$fs,index=1,media=disk,format=raw \
+  -drive file=$kernel,index=0,media=disk,format=raw \
+  -device isa-debug-exit,iobase=0xf4,iosize=0x04 -smp 1 -m 512
+expect {
+  "init: starting sh" {}
+  timeout { puts stderr "QEMU boot timed out"; exit 1 }
+  eof { puts stderr "QEMU exited during boot"; exit 1 }
+}
+send -- "xcrash crash\r"
+expect {
+  -exact "SPEC_CRASH_POINT_$point" {}
+  -re {XCRASH FAIL|panic:} {
+    puts stderr "Guest failed before journal crash point $point"
+    exit 1
+  }
+  timeout {
+    puts stderr "Did not reach journal crash point $point"
+    exit 1
+  }
+  eof {
+    puts stderr "QEMU exited before journal crash point $point"
+    exit 1
+  }
+}
+expect {
+  eof {}
+  timeout {
+    puts stderr "QEMU did not exit at journal crash point $point"
+    exit 1
+  }
+}
+wait
+puts "PASS journal crash point $point"

@@ -1,3 +1,5 @@
+struct inode;
+
 // Per-CPU state
 struct cpu {
   uchar apicid;                // Local APIC ID
@@ -52,6 +54,7 @@ struct proc {
   int fs_gate_depth;           // nested filesystem admission scopes
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
+  struct inode *spec_basecwd;  // Current directory saved at xbegin
   char name[16];               // Process name (debugging)
 };
 

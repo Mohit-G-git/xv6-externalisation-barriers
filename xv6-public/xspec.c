@@ -115,6 +115,78 @@ test_unlink_visibility(void)
 }
 
 static int
+test_namespace_visibility(void)
+{
+  int fd, result;
+  struct stat original, alias;
+  char data[4];
+
+  if(probe_start("xspec-dir/file", &result) < 0 || xbegin() <= 0)
+    return -1;
+  if(mkdir("xspec-dir") < 0)
+    return -1;
+  fd = open("xspec-dir/file", O_CREATE|O_RDWR);
+  if(fd < 0 || write(fd, "priv", 4) != 4 ||
+     fstat(fd, &original) < 0 || close(fd) < 0)
+    return -1;
+  if(link("xspec-dir/file", "xspec-link") < 0 ||
+     probe_finish(result, 0) < 0)
+    return -1;
+  fd = open("xspec-link", O_RDONLY);
+  if(fd < 0 || fstat(fd, &alias) < 0 ||
+     read(fd, data, sizeof(data)) != sizeof(data) ||
+     !is_priv(data) || alias.ino != original.ino || close(fd) < 0)
+    return -1;
+  if(xcommit() < 0)
+    return -1;
+  fd = open("xspec-dir/file", O_RDONLY);
+  if(fd < 0 || read(fd, data, sizeof(data)) != sizeof(data) ||
+     !is_priv(data) || close(fd) < 0)
+    return -1;
+  if(unlink("xspec-link") < 0 || unlink("xspec-dir/file") < 0 ||
+     unlink("xspec-dir") < 0)
+    return -1;
+  return 0;
+}
+
+static int
+test_chdir_lifecycle(void)
+{
+  int fd;
+  char value;
+
+  if(xbegin() <= 0 || mkdir("xspec-cwd-abort") < 0 ||
+     chdir("xspec-cwd-abort") < 0)
+    return -1;
+  fd = open("inside", O_CREATE|O_RDWR);
+  if(fd < 0 || write(fd, "A", 1) != 1 || close(fd) < 0 ||
+     xabort() < 0)
+    return -1;
+  if(open("xspec-cwd-abort/inside", O_RDONLY) >= 0)
+    return -1;
+  fd = open("xspec-root-abort", O_CREATE|O_RDWR);
+  if(fd < 0 || close(fd) < 0 || unlink("xspec-root-abort") < 0)
+    return -1;
+
+  if(xbegin() <= 0 || mkdir("xspec-cwd-commit") < 0 ||
+     chdir("xspec-cwd-commit") < 0)
+    return -1;
+  fd = open("inside", O_CREATE|O_RDWR);
+  if(fd < 0 || write(fd, "C", 1) != 1 || close(fd) < 0 ||
+     xcommit() < 0)
+    return -1;
+  fd = open("xspec-cwd-commit/inside", O_RDONLY);
+  if(fd < 0 || read(fd, &value, 1) != 1 || value != 'C' || close(fd) < 0)
+    return -1;
+  fd = open("xspec-root-commit", O_CREATE|O_RDWR);
+  if(fd < 0 || close(fd) < 0 || unlink("xspec-root-commit") < 0 ||
+     unlink("xspec-cwd-commit/inside") < 0 ||
+     unlink("xspec-cwd-commit") < 0)
+    return -1;
+  return 0;
+}
+
+static int
 test_write_visibility(void)
 {
   int fd, result[2], pid;
@@ -160,6 +232,98 @@ test_write_visibility(void)
     return -1;
   close(fd);
   unlink("xspec-data");
+  return 0;
+}
+
+static void
+conflict_child(int which, int ready[2], int go1[2], int go2[2],
+               int result[2])
+{
+  int fd, control, status;
+  char token, value;
+
+  close(ready[0]);
+  close(result[0]);
+  if(which == 1){
+    close(go1[1]);
+    close(go2[0]);
+    close(go2[1]);
+    control = go1[0];
+    value = '1';
+  } else {
+    close(go2[1]);
+    close(go1[0]);
+    close(go1[1]);
+    control = go2[0];
+    value = '2';
+  }
+  token = 'R';
+  if(write(ready[1], &token, 1) != 1 || xbegin() <= 0)
+    exit();
+  fd = open("xspec-conflict", O_RDWR);
+  if(fd < 0 || write(fd, &value, 1) != 1 || close(fd) < 0 ||
+     read(control, &token, 1) != 1)
+    exit();
+  close(control);
+  if(which == 1)
+    status = xcommit() == 0 ? 'C' : 'E';
+  else if(xcommit() < 0 && xabort() == 0)
+    status = 'X';
+  else
+    status = 'E';
+  write(result[1], (char*)&status, 1);
+  exit();
+}
+
+static int
+test_write_conflict(void)
+{
+  int fd, ready[2], go1[2], go2[2], result[2], pid1, pid2;
+  char token, value;
+
+  fd = open("xspec-conflict", O_CREATE|O_RDWR);
+  if(fd < 0 || write(fd, "0", 1) != 1 || close(fd) < 0 ||
+     pipe(ready) < 0 || pipe(go1) < 0 || pipe(go2) < 0 ||
+     pipe(result) < 0)
+    return -1;
+  pid1 = fork();
+  if(pid1 < 0)
+    return -1;
+  if(pid1 == 0)
+    conflict_child(1, ready, go1, go2, result);
+  pid2 = fork();
+  if(pid2 < 0)
+    return -1;
+  if(pid2 == 0)
+    conflict_child(2, ready, go1, go2, result);
+
+  close(ready[1]);
+  close(go1[0]);
+  close(go2[0]);
+  close(result[1]);
+  if(read(ready[0], &token, 1) != 1 ||
+     read(ready[0], &token, 1) != 1)
+    return -1;
+  close(ready[0]);
+  sleep(10); // Let both children write privately before either commits.
+  token = 'C';
+  if(write(go1[1], &token, 1) != 1 ||
+     read(result[0], &token, 1) != 1 || token != 'C')
+    return -1;
+  wait();
+  if(write(go2[1], &token, 1) != 1 ||
+     read(result[0], &token, 1) != 1 || token != 'X')
+    return -1;
+  wait();
+  close(go1[1]);
+  close(go2[1]);
+  close(result[0]);
+
+  fd = open("xspec-conflict", O_RDONLY);
+  if(fd < 0 || read(fd, &value, 1) != 1 || value != '1' || close(fd) < 0)
+    return -1;
+  if(unlink("xspec-conflict") < 0)
+    return -1;
   return 0;
 }
 
@@ -262,6 +426,28 @@ test_shadow_capacity(void)
   return 0;
 }
 
+static int
+test_journal_capacity(void)
+{
+  int fd;
+  struct stat st;
+  char value;
+
+  memset(bulk, 'J', sizeof(bulk));
+  if(xbegin() <= 0)
+    return -1;
+  fd = open("xspec-journal-capacity", O_CREATE|O_RDWR);
+  if(fd < 0 || write(fd, bulk, 6144) != 6144 || xcommit() < 0 ||
+     close(fd) < 0)
+    return -1;
+  fd = open("xspec-journal-capacity", O_RDONLY);
+  if(fd < 0 || fstat(fd, &st) < 0 || st.size != 6144 ||
+     read(fd, &value, 1) != 1 || value != 'J' || close(fd) < 0 ||
+     unlink("xspec-journal-capacity") < 0)
+    return -1;
+  return 0;
+}
+
 int
 main(void)
 {
@@ -274,16 +460,24 @@ main(void)
 
   if(test_create_visibility() < 0)
     fail("create visibility, snapshot, retry and abort");
+  if(test_namespace_visibility() < 0)
+    fail("directory and hard-link isolation");
+  if(test_chdir_lifecycle() < 0)
+    fail("current-directory restore on commit and abort");
   if(test_unlink_visibility() < 0)
     fail("unlink visibility and abort");
   if(test_write_visibility() < 0)
     fail("data write visibility and abort");
+  if(test_write_conflict() < 0)
+    fail("stale write-set conflict validation");
   if(test_create_unlink_reuse() < 0)
     fail("create/unlink reservation transitions");
   if(test_allocation_arbitration() < 0)
     fail("ordinary allocator reservation arbitration");
   if(test_shadow_capacity() < 0)
     fail("shadow capacity and abort-only handling");
+  if(test_journal_capacity() < 0)
+    fail("publication up to actual journal capacity");
 
   fd = open("xspec-private", O_RDONLY);
   if(fd >= 0){

@@ -191,11 +191,13 @@ mark the context abort-only.
 
 The journal publisher and exclusive filesystem publication gate are present in
 the x86 implementation. `xcommit()` freezes the context, validates the private
-set and recorded base versions, admits one bounded journal operation, installs
-the stable snapshot through real buffers, waits for journal completion, refreshes
-base inode views, and only then publishes held output. A conflicting base block
-or an oversized set fails before home-buffer publication and leaves the context
-abortable. Abort invalidates speculative inode views and discards shadow blocks,
+set and recorded base versions, reserves the complete write set against the
+current usable journal capacity (`min(LOGSIZE, log.size - 1)` minus current
+header occupancy), installs the stable snapshot through real buffers, waits for
+journal completion, refreshes base inode views, and only then publishes held
+output. A conflicting base block or a set larger than the actual journal
+capacity fails before home-buffer publication and leaves the context abortable.
+Abort invalidates speculative inode views and discards shadow blocks,
 reservations and held output. Full read-set/MVCC validation remains a later
 extension; Step 6 validates write-write conflicts only.
 

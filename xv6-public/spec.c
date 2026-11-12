@@ -34,6 +34,49 @@ static struct {
   struct spec_ctx ctx[NSPEC];
 } spectable;
 
+#ifdef SPEC_DEBUG
+static struct spinlock spec_trace_lock;
+static uint spec_trace_sequence;
+#endif
+
+void
+spec_trace(const char *event, int spec_id, int pid, uint dev, uint blockno,
+           int expected, int actual)
+{
+#ifdef SPEC_DEBUG
+  uint sequence;
+  struct proc *p;
+
+  acquire(&spec_trace_lock);
+  sequence = ++spec_trace_sequence;
+  release(&spec_trace_lock);
+  if(pid < 0){
+    p = myproc();
+    pid = p == 0 ? 0 : p->pid;
+  }
+  cprintf("SPEC_EVENT seq=%d event=%s spec=%d pid=%d dev=%d block=%d "
+          "expected=%d actual=%d\n",
+          (int)sequence, event, spec_id, pid, (int)dev, (int)blockno,
+          expected, actual);
+#else
+  (void)event;
+  (void)spec_id;
+  (void)pid;
+  (void)dev;
+  (void)blockno;
+  (void)expected;
+  (void)actual;
+#endif
+}
+
+#ifdef SPEC_DEBUG
+#define SPEC_TRACE(event, id, pid, dev, block, expected, actual) \
+  spec_trace(event, id, pid, dev, block, expected, actual)
+#else
+#define SPEC_TRACE(event, id, pid, dev, block, expected, actual) \
+  ((void)0)
+#endif
+
 static int
 spec_slot(int id)
 {
@@ -88,12 +131,26 @@ spec_drop_proc_locked(struct spec_ctx *ctx, struct proc *p)
   p->spec_id = 0;
 }
 
+static void
+spec_release_inode(struct inode *ip)
+{
+  if(ip == 0)
+    return;
+  begin_op();
+  iput(ip);
+  end_op();
+}
+
 void
 specinit(void)
 {
   int i;
 
   initlock(&spectable.lock, "spectable");
+#ifdef SPEC_DEBUG
+  initlock(&spec_trace_lock, "spectrace");
+  spec_trace_sequence = 0;
+#endif
   for(i = 0; i < NSPEC; i++){
     memset(&spectable.ctx[i], 0, sizeof(spectable.ctx[i]));
     spectable.ctx[i].generation = 1;
@@ -105,6 +162,7 @@ spec_begin(struct proc *p)
 {
   int i, id;
   struct spec_ctx *ctx;
+  struct inode *basecwd;
 
   acquire(&spectable.lock);
   if(p->spec_id != 0){
@@ -116,12 +174,21 @@ spec_begin(struct proc *p)
     }
     spec_drop_proc_locked(ctx, p); // detach a stale terminal association.
   }
+  release(&spectable.lock);
 
+  if(p->spec_basecwd != 0 || p->cwd == 0)
+    panic("spec_begin: cwd state");
+  basecwd = idup(p->cwd);
+  if(basecwd == 0)
+    return -1;
+
+  acquire(&spectable.lock);
   for(i = 0; i < NSPEC; i++)
     if(spectable.ctx[i].state == SPEC_FREE)
       break;
   if(i == NSPEC){
     release(&spectable.lock);
+    spec_release_inode(basecwd);
     return -1;
   }
 
@@ -138,8 +205,10 @@ spec_begin(struct proc *p)
   ctx->proc_refs = 1;
   ctx->op_refs = 0;
   ctx->file_refs = 0;
+  p->spec_basecwd = basecwd;
   p->spec_id = id;
   release(&spectable.lock);
+  SPEC_TRACE("begin", id, p->pid, 0, 0, 0, 0);
   return id;
 }
 
@@ -166,6 +235,7 @@ spec_commit(struct proc *p)
   release(&spectable.lock);
 
   if(result == 1){
+    SPEC_TRACE("commit_begin", id, p->pid, 0, 0, 0, 0);
     // A speculative pipe reader can otherwise sleep indefinitely while its
     // operation reference prevents this commit from draining.
     pipe_context_wakeup(id);
@@ -183,8 +253,7 @@ spec_commit(struct proc *p)
     }
     release(&spectable.lock);
 
-    // Member 4's atomic publisher is not present. Freeze and preserve a
-    // nonempty private set; never discard it or report a partial commit.
+    // Freeze the private set before validating or publishing it.
     if(shadow_freeze(id) < 0){
       acquire(&spectable.lock);
       ctx = spec_lookup_locked(id);
@@ -232,22 +301,6 @@ spec_commit(struct proc *p)
     }
     shadow_snapshot_end(&snapshot);
 
-    // xv6's begin_op() reserves MAXOPBLOCKS for one operation. Keep the
-    // outer speculative commit atomic by rejecting a larger final set before
-    // touching any real buffer.
-    if(nblocks > MAXOPBLOCKS){
-      if(shadow_thaw(id) < 0)
-        panic("spec_commit: shadow thaw");
-      acquire(&spectable.lock);
-      ctx = spec_lookup_locked(id);
-      if(ctx != 0 && ctx->state == SPEC_COMMITTING)
-        ctx->state = SPEC_ACTIVE;
-      if(ctx != 0)
-        wakeup(ctx);
-      release(&spectable.lock);
-      return -1;
-    }
-
     // Block new filesystem admissions before conflict validation and keep
     // exclusive ownership through journal completion and cache refresh.
     fs_gate_publish_begin();
@@ -262,6 +315,23 @@ spec_commit(struct proc *p)
       if(ctx != 0)
         wakeup(ctx);
       release(&spectable.lock);
+      SPEC_TRACE("commit_conflict", id, p->pid, 0, 0, 0, 0);
+      return -1;
+    }
+
+    // Reserve the entire frozen set against the actual journal capacity.
+    // Failure is reported before any base buffer can be modified.
+    if(log_begin_op_commit(&epoch, nblocks) < 0){
+      fs_gate_publish_end();
+      if(shadow_thaw(id) < 0)
+        panic("spec_commit: capacity thaw");
+      acquire(&spectable.lock);
+      ctx = spec_lookup_locked(id);
+      if(ctx != 0 && ctx->state == SPEC_COMMITTING)
+        ctx->state = SPEC_ACTIVE;
+      if(ctx != 0)
+        wakeup(ctx);
+      release(&spectable.lock);
       return -1;
     }
 
@@ -269,7 +339,6 @@ spec_commit(struct proc *p)
     // cache and log. The private image is never installed with bwrite().
     if(shadow_snapshot_begin(id, &snapshot) < 0)
       panic("spec_commit: publish snapshot");
-    log_begin_op_commit(&epoch);
     seen = 0;
     while((next = shadow_snapshot_next(&snapshot, &block)) > 0){
       struct buf *bp;
@@ -286,10 +355,25 @@ spec_commit(struct proc *p)
     log_end_op_commit();
     log_wait_commit(epoch);
 
+    // Publish a new base generation for every committed block. Without this,
+    // a later transaction could validate against a version from before this
+    // commit and overwrite the newer contents.
+    if(shadow_snapshot_begin(id, &snapshot) < 0)
+      panic("spec_commit: generation snapshot");
+    seen = 0;
+    while((next = shadow_snapshot_next(&snapshot, &block)) > 0){
+      shadow_note_base_write(block.dev, block.blockno);
+      seen++;
+    }
+    shadow_snapshot_end(&snapshot);
+    if(next < 0 || seen != nblocks)
+      panic("spec_commit: generation snapshot changed");
+
     fs_spec_publish(id);
     shadow_discard(id);
     spec_output_publish(id);
     fs_gate_publish_end();
+    spec_cwd_restore(id);
     acquire(&spectable.lock);
     ctx = spec_lookup_locked(id);
     if(ctx == 0 || ctx->state != SPEC_COMMITTING){
@@ -299,6 +383,7 @@ spec_commit(struct proc *p)
     ctx->state = SPEC_COMMITTED;
     wakeup(ctx);
     release(&spectable.lock);
+    SPEC_TRACE("commit_done", id, p->pid, 0, 0, 0, 0);
     acquire(&spectable.lock);
     ctx = spec_lookup_locked(id);
     spec_drop_proc_locked(ctx, p);
@@ -325,6 +410,7 @@ spec_abort(struct proc *p)
   }
   release(&spectable.lock);
   if(result == 0){
+    SPEC_TRACE("abort", id, p->pid, 0, 0, 0, 0);
     pipe_context_wakeup(id);
     acquire(&spectable.lock);
     ctx = spec_lookup_locked(id);
@@ -332,8 +418,10 @@ spec_abort(struct proc *p)
       sleep(ctx, &spectable.lock);
     release(&spectable.lock);
     fs_spec_discard(id);
+    spec_cwd_restore(id);
     shadow_discard(id);
     spec_output_discard(id);
+    SPEC_TRACE("cleanup", id, p->pid, 0, 0, 0, 0);
     acquire(&spectable.lock);
     ctx = spec_lookup_locked(id);
     if(ctx != 0){
@@ -366,6 +454,8 @@ spec_fork_attach(struct proc *parent, struct proc *child)
     spec_drop_proc_locked(ctx, parent);
   }
   release(&spectable.lock);
+  if(child->spec_id != 0)
+    SPEC_TRACE("fork_attach", child->spec_id, child->pid, 0, 0, 0, 0);
 }
 
 void
@@ -385,6 +475,7 @@ spec_proc_exit(struct proc *p)
   }
   release(&spectable.lock);
   if(aborted){
+    SPEC_TRACE("owner_exit_abort", id, p->pid, 0, 0, 0, 0);
     pipe_context_wakeup(id);
     acquire(&spectable.lock);
     ctx = spec_lookup_locked(id);
@@ -392,8 +483,10 @@ spec_proc_exit(struct proc *p)
       sleep(ctx, &spectable.lock);
     release(&spectable.lock);
     fs_spec_discard(id);
+    spec_cwd_restore(id);
     shadow_discard(id);
     spec_output_discard(id);
+    SPEC_TRACE("cleanup", id, p->pid, 0, 0, 0, 0);
   }
   acquire(&spectable.lock);
   ctx = spec_lookup_locked(p->spec_id);

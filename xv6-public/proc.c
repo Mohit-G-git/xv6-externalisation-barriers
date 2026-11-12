@@ -7,6 +7,7 @@
 #include "proc.h"
 #include "spinlock.h"
 #include "spec.h"
+#include "fs.h"
 
 struct {
   struct spinlock lock;
@@ -93,6 +94,7 @@ found:
   p->spec_fault = 0;
   p->fs_error = 0;
   p->fs_gate_depth = 0;
+  p->spec_basecwd = 0;
 
   release(&ptable.lock);
 
@@ -215,6 +217,11 @@ fork(void)
 
   safestrcpy(np->name, curproc->name, sizeof(curproc->name));
   spec_fork_attach(curproc, np);
+  if(np->spec_id != 0){
+    if(curproc->spec_basecwd == 0)
+      panic("fork: missing speculative cwd");
+    np->spec_basecwd = idup(curproc->spec_basecwd);
+  }
 
   pid = np->pid;
 
@@ -225,6 +232,34 @@ fork(void)
   release(&ptable.lock);
 
   return pid;
+}
+
+// Current directories are process-local references, not disk blocks. Restore
+// each member to its xbegin directory before private inode views are retired.
+void
+spec_cwd_restore(int spec_id)
+{
+  int i;
+  struct proc *p;
+  struct inode *oldcwd;
+
+  for(i = 0; i < NPROC; i++){
+    acquire(&ptable.lock);
+    p = &ptable.proc[i];
+    if(p->state == UNUSED || p->spec_id != spec_id ||
+       p->cwd == 0 || p->spec_basecwd == 0){
+      release(&ptable.lock);
+      continue;
+    }
+    oldcwd = p->cwd;
+    p->cwd = p->spec_basecwd;
+    p->spec_basecwd = 0;
+    release(&ptable.lock);
+
+    begin_op();
+    iput(oldcwd);
+    end_op();
+  }
 }
 
 // Exit the current process.  Does not return.
@@ -266,6 +301,13 @@ exit(void)
   if(exitref){
     spec_op_leave(&exitop);
     spec_proc_exit(curproc);
+  }
+
+  if(curproc->spec_basecwd){
+    begin_op();
+    iput(curproc->spec_basecwd);
+    end_op();
+    curproc->spec_basecwd = 0;
   }
 
   acquire(&ptable.lock);
@@ -313,6 +355,7 @@ wait(void)
         freevm(p->pgdir);
         p->pid = 0;
         p->spec_id = 0;
+        p->spec_basecwd = 0;
         p->parent = 0;
         p->name[0] = 0;
         p->killed = 0;

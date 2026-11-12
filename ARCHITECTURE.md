@@ -58,5 +58,13 @@ Initial isolation requirements: speculative participants and descendants read th
 
 1. Preserve the assignment’s behavior and member boundaries, but translate platform details: x86 syscall entry is `int $T_SYSCALL`, the user stubs are in `usys.S`, filesystem sources are flat under `xv6-public/`, and QEMU is `qemu-system-i386`.
 2. Use xv6-x86's actual `sleep(chan, spinlock*)` interface and its ordinary `LOGSIZE` / `MAXOPBLOCKS` constants; do not copy RISC-V-only helpers such as `sleep_prepare`, `copyin`, `copyout` signatures or `usys.pl` edits.
-3. Keep the transaction registry separate from `struct proc`; process membership is an ID/reference, not the owner of shadow blocks. Shadow storage, buffer-cache routing, external I/O, and durable commit remain coordinated with their assigned owners.
-4. Implement in reviewable stages. This document completes the architecture-analysis deliverable only; it does not claim that speculation or transactional isolation has been implemented.
+3. Keep the transaction registry separate from `struct proc`; process membership is an ID/reference, not the owner of shadow blocks. The x86 implementation follows this split across `spec.c`, `shadow.c`, `specio.c`, filesystem view code, and `log.c`.
+4. The architecture has been implemented through transactional commit, abort, and xv6 journal integration. `SPECULATION_DESIGN.md` records the resulting subsystem boundaries and current limits.
+
+## Implemented transaction boundary
+
+The x86 syscalls `xbegin()`, `xcommit()`, and `xabort()` manage a shared context inherited by forked processes. Filesystem reads and mutations use context-specific inode and block views; namespace allocation is reserved across ordinary and speculative operations. Abort discards private blocks, reservations, inode views, and held external output. Commit freezes and validates the write set, then publishes through the redo journal while the filesystem admission gate excludes observers and writers.
+
+The publisher reserves the complete unique block set against the current on-disk journal capacity (`min(LOGSIZE, log.size - 1)` minus current header occupancy) before modifying base buffers. Ordinary filesystem operations still reserve `MAXOPBLOCKS`. The private shadow quota is 16 blocks per context, so it remains the tighter current write-set bound. Commit validation detects stale writes to blocks in the write set; full read-set validation and general MVCC are not implemented.
+
+`make test-qemu QEMU=/path/to/qemu-system-i386` runs lifecycle, namespace, conflict, allocation, journal-capacity, console, and pipe regressions. `make crash-test QEMU=/path/to/qemu-system-i386` checks recovery before and after the journal header commit point and during home-block installation. Optional structured tracing is enabled with `SPEC_DEBUG=1`; crash injection is test-only and selected with `SPEC_CRASH_POINT=1`, `2`, or `3`.

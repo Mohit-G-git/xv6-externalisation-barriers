@@ -96,7 +96,7 @@ void            microdelay(int);
 // log.c
 void            initlog(int dev);
 void            log_write(struct buf*);
-void            log_begin_op_commit(uint*);
+int             log_begin_op_commit(uint*, int);
 void            log_end_op_commit(void);
 uint            log_commit_epoch(void);
 void            log_wait_commit(uint);
@@ -162,6 +162,8 @@ int             shadow_peak(void);
 int             spec_abort(struct proc*);
 int             spec_begin(struct proc*);
 int             spec_commit(struct proc*);
+void            spec_trace(const char*, int, int, uint, uint, int, int);
+void            spec_cwd_restore(int);
 void            spec_fork_attach(struct proc*, struct proc*);
 void            spec_proc_exit(struct proc*);
 void            specinit(void);

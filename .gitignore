@@ -14,3 +14,9 @@ xv6-public/mkfs
 xv6-public/_*
 ._*
 xv6-public/._*
+
+# Supplemental local status and test notes
+/AUDIT_STATUS.md
+/STEP6_JOURNAL_NOTES.md
+/TEST_RESULTS.md
+/results/README.md

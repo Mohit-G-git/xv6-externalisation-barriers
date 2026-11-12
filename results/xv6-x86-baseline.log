@@ -1,7 +1,8 @@
 Baseline run metadata
 --------------------
 Kernel/source revision before this work: 052819f80374d98f328ccab20d1cac5c151c602f
-Worktree during test: modified only by the baseline user program and Makefile UPROGS entry
+Kernel source: clean detached worktree at the baseline revision
+Measurement program: `baseline.c` copied into the detached worktree; `_baseline` supplied as a Makefile UPROGS override
 QEMU: QEMU emulator version 10.2.4
 Architecture: xv6-public x86, qemu-system-i386
 CPUS: 1
@@ -28,7 +29,7 @@ write,65536,14,65536
 BASELINE PASS
 $
 
-The benchmark values are one trial using the kernel's coarse global `uptime()` tick counter. They include only the user `write()` call, but tick resolution and QEMU scheduling are coarse; repeat trials and report spread before drawing performance conclusions. The concurrent-write check verifies the resulting file has the expected length and only bytes written by either child; it is a functional smoke test, not a formal atomicity guarantee.
+The benchmark values use the kernel's coarse global `uptime()` tick counter and include only the user `write()` call. The concurrent-write check verifies the resulting file has the expected length and only bytes written by either child; it is a functional smoke test, not a formal atomicity guarantee.
 
 Three-CPU run
 -------------
@@ -43,3 +44,35 @@ write,16384,2,16384
 write,32768,6,32768
 write,65536,10,65536
 BASELINE PASS
+
+Repeat trial 2
+--------------
+The baseline kernel was rebuilt from the same historical revision in a detached
+worktree. QEMU 10.2.4 was run with the same x86 machine, 512 MB RAM, filesystem
+size, and CPU counts. The measurement program was copied from the repository's
+`baseline.c`; `_baseline` was passed through `UPROGS` without changing the
+baseline kernel source. Each run completed with `BASELINE PASS`.
+
+CPUS=1, trial=2
+benchmark,size_bytes,elapsed_ticks,bytes_written
+write,1024,5,1024
+write,2048,4,2048
+write,4096,23,4096
+write,8192,11,8192
+write,16384,31,16384
+write,32768,75,32768
+write,65536,146,65536
+
+CPUS=3, trial=2
+benchmark,size_bytes,elapsed_ticks,bytes_written
+write,1024,12,1024
+write,2048,21,2048
+write,4096,49,4096
+write,8192,65,8192
+write,16384,58,16384
+write,32768,162,32768
+write,65536,336,65536
+
+The large spread from trial 1 confirms that tick resolution and emulator
+scheduling dominate these measurements. Treat them as functional baseline
+evidence only; they do not support a reliable performance comparison.

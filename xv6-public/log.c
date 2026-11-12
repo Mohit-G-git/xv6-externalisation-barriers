@@ -5,6 +5,7 @@
 #include "sleeplock.h"
 #include "fs.h"
 #include "buf.h"
+#include "x86.h"
 
 // Simple logging that allows concurrent FS system calls.
 //
@@ -42,6 +43,7 @@ struct log {
   int size;
   int outstanding; // how many FS sys calls are executing.
   int committing;  // in commit(), please wait.
+  int spec_pending; // the current log transaction includes an xcommit().
   uint commit_epoch; // increments after each completed journal commit.
   int dev;
   struct logheader lh;
@@ -49,7 +51,7 @@ struct log {
 struct log log;
 
 static void recover_from_log(void);
-static void commit();
+static void commit(int speculative);
 
 static void
 log_begin_op_core(uint *epoch)
@@ -70,25 +72,30 @@ log_begin_op_core(uint *epoch)
 }
 
 static void
-log_end_op_core(void)
+log_end_op_core(int speculative)
 {
   int do_commit = 0;
+  int commit_speculative = 0;
 
   acquire(&log.lock);
+  if(speculative)
+    log.spec_pending = 1;
   log.outstanding--;
   if(log.committing)
     panic("log.committing");
   if(log.outstanding == 0){
     do_commit = 1;
+    commit_speculative = log.spec_pending;
     log.committing = 1;
   } else
     wakeup(&log);
   release(&log.lock);
 
   if(do_commit){
-    commit();
+    commit(commit_speculative);
     acquire(&log.lock);
     log.commit_epoch++;
+    log.spec_pending = 0;
     log.committing = 0;
     wakeup(&log);
     release(&log.lock);
@@ -107,6 +114,7 @@ initlog(int dev)
   log.start = sb.logstart;
   log.size = sb.nlog;
   log.dev = dev;
+  log.spec_pending = 0;
   log.commit_epoch = 0;
   recover_from_log();
 }
@@ -193,6 +201,10 @@ recover_from_log(void)
 void
 begin_op(void)
 {
+  // Acquire the filesystem gate before reserving journal capacity. Keeping
+  // both until end_op prevents a publisher from waiting on an operation that
+  // is itself blocked behind the publisher's gate.
+  fs_gate_enter();
   log_begin_op_core(0);
 }
 
@@ -201,19 +213,41 @@ begin_op(void)
 void
 end_op(void)
 {
-  log_end_op_core();
+  log_end_op_core(0);
+  fs_gate_leave();
 }
 
-void
-log_begin_op_commit(uint *epoch)
+int
+log_begin_op_commit(uint *epoch, int nblocks)
 {
-  log_begin_op_core(epoch);
+  int capacity;
+
+  acquire(&log.lock);
+  for(;;){
+    if(log.committing || log.outstanding != 0){
+      sleep(&log, &log.lock);
+      continue;
+    }
+    capacity = log.size - 1;
+    if(capacity > LOGSIZE)
+      capacity = LOGSIZE;
+    if(nblocks < 0 || log.lh.n > capacity ||
+       nblocks > capacity - log.lh.n){
+      release(&log.lock);
+      return -1;
+    }
+    log.outstanding = 1;
+    if(epoch)
+      *epoch = log.commit_epoch;
+    release(&log.lock);
+    return 0;
+  }
 }
 
 void
 log_end_op_commit(void)
 {
-  log_end_op_core();
+  log_end_op_core(1);
 }
 
 // Copy modified blocks from cache to log.
@@ -233,12 +267,31 @@ write_log(void)
 }
 
 static void
-commit()
+crash_test_point(int speculative, int point)
+{
+#if defined(SPEC_CRASH_POINT)
+  if(speculative && SPEC_CRASH_POINT == point){
+    cprintf("SPEC_CRASH_POINT_%d\n", point);
+    asm volatile("outl %0, %w1" : : "a"(1), "d"(0xf4));
+    for(;;)
+      asm volatile("hlt");
+  }
+#else
+  (void)speculative;
+  (void)point;
+#endif
+}
+
+static void
+commit(int speculative)
 {
   if (log.lh.n > 0) {
     write_log();     // Write modified blocks from cache to log
+    crash_test_point(speculative, 1);
     write_head();    // Write header to disk -- the real commit
+    crash_test_point(speculative, 2);
     install_trans(); // Now install writes to home locations
+    crash_test_point(speculative, 3);
     log.lh.n = 0;
     write_head();    // Erase the transaction from the log
   }

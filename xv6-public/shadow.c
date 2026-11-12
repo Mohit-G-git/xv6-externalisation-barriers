@@ -60,6 +60,9 @@ static struct {
   uint next_version;
 } reservations;
 
+#define SHADOW_TRACE(event, id, dev, block, expected, actual) \
+  spec_trace(event, id, -1, dev, block, expected, actual)
+
 static int
 shadow_slot(int spec_id)
 {
@@ -160,12 +163,14 @@ shadow_read(int spec_id, uint dev, uint blockno, char *dst)
   index = shadow_find_locked(spec_id, dev, blockno, 0);
   if(index < 0){
     release(&shadow_table.lock);
+    SHADOW_TRACE("block_read", spec_id, dev, blockno, 0, 0);
     return 0;
   }
   shadow_table.entry[index].refs++;
   memmove(dst, shadow_table.entry[index].data, BSIZE);
   shadow_table.entry[index].refs--;
   release(&shadow_table.lock);
+  SHADOW_TRACE("block_read", spec_id, dev, blockno, 0, 1);
   return 1;
 }
 
@@ -192,13 +197,16 @@ shadow_write_versioned(int spec_id, uint dev, uint blockno,
   int index, bucket;
   int count;
   int slot;
+  int allocated;
 
   if(spec_id <= 0 || base == 0 || src == 0 ||
      dev >= NDEV || blockno >= FSSIZE || (slot = shadow_slot(spec_id)) < 0)
     return -1;
+  allocated = 0;
   acquire(&shadow_table.lock);
   if(shadow_table.frozen_id[slot] != 0){
     release(&shadow_table.lock);
+    SHADOW_TRACE("block_write_rejected", spec_id, dev, blockno, 0, -1);
     return -1;
   }
   index = shadow_find_locked(spec_id, dev, blockno, 0);
@@ -206,6 +214,8 @@ shadow_write_versioned(int spec_id, uint dev, uint blockno,
     count = shadow_count_locked(spec_id);
     if(count >= NSHADOW_QUOTA || shadow_table.free_head < 0){
       release(&shadow_table.lock);
+      SHADOW_TRACE("shadow_exhausted", spec_id, dev, blockno,
+                   NSHADOW_QUOTA, count);
       return -1;
     }
     index = shadow_table.free_head;
@@ -220,6 +230,7 @@ shadow_write_versioned(int spec_id, uint dev, uint blockno,
     shadow_table.entry[index].refs = 0;
     shadow_table.entry[index].base_version = base_version;
     memmove(shadow_table.entry[index].base, base, BSIZE);
+    allocated = 1;
     shadow_table.allocated++;
     if(shadow_table.allocated > shadow_table.peak)
       shadow_table.peak = shadow_table.allocated;
@@ -228,6 +239,9 @@ shadow_write_versioned(int spec_id, uint dev, uint blockno,
   memmove(shadow_table.entry[index].data, src, BSIZE);
   shadow_table.entry[index].refs--;
   release(&shadow_table.lock);
+  if(allocated)
+    SHADOW_TRACE("block_alloc", spec_id, dev, blockno, 0, (int)base_version);
+  SHADOW_TRACE("block_write", spec_id, dev, blockno, 0, (int)base_version);
   return 0;
 }
 
@@ -253,13 +267,17 @@ shadow_base_version(uint dev, uint blockno)
 void
 shadow_note_base_write(uint dev, uint blockno)
 {
+  uint version;
+
   if(dev >= NDEV || blockno >= FSSIZE)
     return;
   acquire(&shadow_table.lock);
   shadow_table.base_version[dev][blockno]++;
   if(shadow_table.base_version[dev][blockno] == 0)
     shadow_table.base_version[dev][blockno] = 1;
+  version = shadow_table.base_version[dev][blockno];
   release(&shadow_table.lock);
+  SHADOW_TRACE("base_write", 0, dev, blockno, 0, (int)version);
 }
 
 int
@@ -267,6 +285,7 @@ shadow_validate_versions(int spec_id)
 {
   int i;
   uint version;
+  uint dev, blockno, expected;
 
   acquire(&shadow_table.lock);
   for(i = 0; i < NSHADOW; i++){
@@ -274,7 +293,12 @@ shadow_validate_versions(int spec_id)
     if(e->state == SHADOW_ALLOCATED && e->spec_id == spec_id){
       version = shadow_table.base_version[e->dev][e->blockno];
       if(version != e->base_version){
+        dev = e->dev;
+        blockno = e->blockno;
+        expected = e->base_version;
         release(&shadow_table.lock);
+        SHADOW_TRACE("write_conflict", spec_id, dev, blockno,
+                     (int)expected, (int)version);
         return -1;
       }
     }
