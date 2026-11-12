@@ -179,6 +179,7 @@ UPROGS=\
 	_xspec\
 	_xio\
 	_xcrash\
+	_xnested\
 
 fs.img: mkfs README $(UPROGS)
 	./mkfs fs.img README $(UPROGS)

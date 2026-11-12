@@ -24,7 +24,7 @@ proc run_test {command marker} {
   send -- "$command\r"
   expect {
     -exact $marker { puts "PASS $command" }
-    -re {X(SPEC|IO) FAIL|panic:|^FAIL} {
+    -re {X(SPEC|IO|NESTED) FAIL|panic:|^FAIL} {
       puts stderr "Guest reported failure while running $command"
       exit 1
     }
@@ -40,6 +40,7 @@ proc run_test {command marker} {
 }
 
 run_test "xspec" "XSPEC PASS (filesystem isolation and lifecycle)"
+run_test "xnested" "XNESTED PASS (nested merge and abort)"
 run_test "xio console-abort" "CONSOLE_ABORT_DONE"
 run_test "xio console-commit" "CONSOLE_COMMIT_DONE"
 run_test "xio console-cap" "CONSOLE_CAPACITY_OK"
