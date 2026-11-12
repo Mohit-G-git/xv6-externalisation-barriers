@@ -286,6 +286,101 @@ mixed_readers(void)
 }
 
 static int
+multiple_writers(void)
+{
+  int p[2], reader, writer1, writer2, pid;
+  char data[128], got[256];
+  int n, total, acount, bcount, i;
+
+  if(pipe(p) < 0)
+    return -1;
+  reader = fork();
+  if(reader < 0)
+    return -1;
+  if(reader == 0){
+    close(p[1]);
+    total = 0;
+    while(total < sizeof(got)){
+      n = read(p[0], got + total, sizeof(got) - total);
+      if(n <= 0)
+        break;
+      total += n;
+    }
+    if(total != sizeof(got) || read(p[0], got, 1) != 0)
+      exit();
+    acount = bcount = 0;
+    for(i = 0; i < total; i++){
+      if(got[i] == 'A')
+        acount++;
+      else if(got[i] == 'B')
+        bcount++;
+      else
+        exit();
+    }
+    // Each write is smaller than PIPESIZE and must stay contiguous.
+    if(acount != 128 || bcount != 128 ||
+       !((got[0] == 'A' && got[127] == 'A' && got[128] == 'B' && got[255] == 'B') ||
+         (got[0] == 'B' && got[127] == 'B' && got[128] == 'A' && got[255] == 'A')))
+      exit();
+    printf(1, "MULTI_WRITER_PIPE_OK\n");
+    exit();
+  }
+  close(p[0]);
+  if(xbegin() <= 0)
+    return -1;
+  memset(data, 'A', sizeof(data));
+  writer1 = fork();
+  if(writer1 < 0)
+    return -1;
+  if(writer1 == 0){
+    if(write(p[1], data, sizeof(data)) != sizeof(data))
+      exit();
+    exit();
+  }
+  memset(data, 'B', sizeof(data));
+  writer2 = fork();
+  if(writer2 < 0)
+    return -1;
+  if(writer2 == 0){
+    if(write(p[1], data, sizeof(data)) != sizeof(data))
+      exit();
+    exit();
+  }
+  if(wait() < 0 || wait() < 0 || xcommit() < 0)
+    return -1;
+  close(p[1]);
+  pid = wait();
+  return pid == reader ? 0 : -1;
+}
+
+static int
+reader_exit(void)
+{
+  int p[2], pid, result;
+
+  if(pipe(p) < 0)
+    return -1;
+  pid = fork();
+  if(pid < 0)
+    return -1;
+  if(pid == 0){
+    close(p[0]);
+    close(p[1]);
+    exit();
+  }
+  close(p[0]);
+  if(wait() != pid || xbegin() <= 0)
+    return -1;
+  result = write(p[1], "X", 1);
+  if(result != 0 || xabort() < 0){
+    close(p[1]);
+    return -1;
+  }
+  close(p[1]);
+  return 0;
+}
+
+static int
 ordinary_pipe(void)
 {
   int p[2];
@@ -411,6 +506,14 @@ main(int argc, char **argv)
     if(mixed_readers() < 0)
       fail("mixed pipe readers");
     printf(1, "PIPE_MIXED_DONE\n");
+  } else if(strcmp(argv[1], "pipe-multi-writer") == 0){
+    if(multiple_writers() < 0)
+      fail("multiple pipe writers");
+    printf(1, "PIPE_MULTI_WRITER_DONE\n");
+  } else if(strcmp(argv[1], "pipe-reader-exit") == 0){
+    if(reader_exit() < 0)
+      fail("pipe reader exit");
+    printf(1, "PIPE_READER_EXIT_DONE\n");
   } else if(strcmp(argv[1], "pipe-ordinary") == 0){
     if(ordinary_pipe() < 0)
       fail("ordinary pipe");

@@ -24,7 +24,7 @@ proc run_test {command marker} {
   send -- "$command\r"
   expect {
     -exact $marker { puts "PASS $command" }
-    -re {X(SPEC|IO|NESTED) FAIL|panic:|^FAIL} {
+    -re {_LEAK|_BAD|X(SPEC|IO|NESTED) FAIL|panic:|^FAIL} {
       puts stderr "Guest reported failure while running $command"
       exit 1
     }
@@ -39,18 +39,73 @@ proc run_test {command marker} {
   }
 }
 
+proc run_ordered_test {command first second done forbidden} {
+  send -- "$command\r"
+  expect {
+    -exact $forbidden {
+      puts stderr "Output '$forbidden' escaped before '$first' in $command"
+      exit 1
+    }
+    -exact $first {}
+    -re {_LEAK|_BAD|X(SPEC|IO|NESTED) FAIL|panic:|^FAIL} {
+      puts stderr "Guest reported failure while running $command"
+      exit 1
+    }
+    timeout {
+      puts stderr "Timed out waiting for '$first' from $command"
+      exit 1
+    }
+    eof {
+      puts stderr "QEMU exited before '$first' from $command"
+      exit 1
+    }
+  }
+  expect {
+    -exact $second {}
+    -re {_LEAK|_BAD|X(SPEC|IO|NESTED) FAIL|panic:|^FAIL} {
+      puts stderr "Guest reported failure while running $command"
+      exit 1
+    }
+    timeout {
+      puts stderr "Timed out waiting for '$second' from $command"
+      exit 1
+    }
+    eof {
+      puts stderr "QEMU exited before '$second' from $command"
+      exit 1
+    }
+  }
+  expect {
+    -exact $done { puts "PASS $command" }
+    -re {_LEAK|_BAD|X(SPEC|IO|NESTED) FAIL|panic:|^FAIL} {
+      puts stderr "Guest reported failure while running $command"
+      exit 1
+    }
+    timeout {
+      puts stderr "Timed out waiting for '$done' from $command"
+      exit 1
+    }
+    eof {
+      puts stderr "QEMU exited before '$done' from $command"
+      exit 1
+    }
+  }
+}
+
 run_test "xspec" "XSPEC PASS (filesystem isolation and lifecycle)"
 run_test "xnested" "XNESTED PASS (nested merge and abort)"
 run_test "xio console-abort" "CONSOLE_ABORT_DONE"
-run_test "xio console-commit" "CONSOLE_COMMIT_DONE"
+run_ordered_test "xio console-commit" "CONSOLE_COMMIT_OBSERVER" "CONSOLE_COMMIT_PAYLOAD" "CONSOLE_COMMIT_DONE" "CONSOLE_COMMIT_PAYLOAD"
 run_test "xio console-cap" "CONSOLE_CAPACITY_OK"
 run_test "xio pipe-same" "PIPE_SAME_DONE"
-run_test "xio pipe-commit" "PIPE_COMMIT_DONE"
+run_ordered_test "xio pipe-commit" "PIPE_COMMIT_MARK" "OUTSIDE_PIPE_C" "PIPE_COMMIT_DONE" "OUTSIDE_PIPE_C"
 run_test "xio pipe-abort" "PIPE_ABORT_DONE"
 run_test "xio pipe-wrap" "PIPE_WRAP_OK"
 run_test "xio pipe-full" "PIPE_FULL_DONE"
 run_test "xio pipe-full-abort" "PIPE_FULL_ABORT_DONE"
 run_test "xio pipe-mixed" "PIPE_MIXED_DONE"
+run_test "xio pipe-multi-writer" "PIPE_MULTI_WRITER_DONE"
+run_test "xio pipe-reader-exit" "PIPE_READER_EXIT_DONE"
 run_test "xio pipe-ordinary" "PIPE_ORDINARY_OK"
 run_test "xio pipe-blocked-commit" "PIPE_BLOCKED_COMMIT_DRAINED"
 run_test "xio pipe-blocked-abort" "PIPE_BLOCKED_ABORT_DRAINED"
