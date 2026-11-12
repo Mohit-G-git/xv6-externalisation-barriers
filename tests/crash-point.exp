@@ -43,5 +43,10 @@ expect {
     exit 1
   }
 }
-wait
+set result [wait]
+set exit_status [lindex $result 3]
+if {$exit_status != 3} {
+  puts stderr "QEMU exited with status $exit_status instead of debug-exit status 3"
+  exit 1
+}
 puts "PASS journal crash point $point"

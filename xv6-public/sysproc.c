@@ -7,6 +7,7 @@
 #include "mmu.h"
 #include "proc.h"
 #include "spec.h"
+#include "shadow.h"
 
 int
 sys_fork(void)
@@ -107,4 +108,19 @@ int
 sys_xabort(void)
 {
   return spec_abort(myproc());
+}
+
+int
+sys_xstats(void)
+{
+  struct shadow_metrics stats;
+
+  shadow_metrics_get(&stats);
+  cprintf("SHADOW_METRICS,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+          (int)stats.allocated, (int)stats.peak, (int)stats.capacity,
+          (int)stats.allocation_failures, (int)stats.lookups,
+          (int)stats.lookup_hits, (int)stats.lookup_misses,
+          (int)stats.bucket_acquires, (int)stats.bucket_contention,
+          (int)stats.data_acquires);
+  return 0;
 }

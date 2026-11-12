@@ -103,6 +103,7 @@ int             log_begin_op_commit(uint*, int);
 void            log_end_op_commit(void);
 uint            log_commit_epoch(void);
 void            log_wait_commit(uint);
+void            log_crash_test_point(int, int);
 void            begin_op();
 void            end_op();
 

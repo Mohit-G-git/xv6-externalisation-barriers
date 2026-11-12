@@ -143,7 +143,7 @@ log_wait_commit(uint epoch)
 
 // Copy committed blocks from log to their home location
 static void
-install_trans(void)
+install_trans(int speculative)
 {
   int tail;
 
@@ -154,6 +154,8 @@ install_trans(void)
     bwrite(dbuf);  // write dst to disk
     brelse(lbuf);
     brelse(dbuf);
+    if(tail == 0)
+      log_crash_test_point(speculative, 4);
   }
 }
 
@@ -192,7 +194,7 @@ static void
 recover_from_log(void)
 {
   read_head();
-  install_trans(); // if committed, copy from log to disk
+  install_trans(0); // if committed, copy from log to disk
   log.lh.n = 0;
   write_head(); // clear the log
 }
@@ -252,7 +254,7 @@ log_end_op_commit(void)
 
 // Copy modified blocks from cache to log.
 static void
-write_log(void)
+write_log(int speculative)
 {
   int tail;
 
@@ -263,11 +265,13 @@ write_log(void)
     bwrite(to);  // write the log
     brelse(from);
     brelse(to);
+    if(tail == 0)
+      log_crash_test_point(speculative, 8);
   }
 }
 
-static void
-crash_test_point(int speculative, int point)
+void
+log_crash_test_point(int speculative, int point)
 {
 #if defined(SPEC_CRASH_POINT)
   if(speculative && SPEC_CRASH_POINT == point){
@@ -286,14 +290,15 @@ static void
 commit(int speculative)
 {
   if (log.lh.n > 0) {
-    write_log();     // Write modified blocks from cache to log
-    crash_test_point(speculative, 1);
+    write_log(speculative); // Write modified blocks from cache to log
+    log_crash_test_point(speculative, 2);
     write_head();    // Write header to disk -- the real commit
-    crash_test_point(speculative, 2);
-    install_trans(); // Now install writes to home locations
-    crash_test_point(speculative, 3);
+    log_crash_test_point(speculative, 3);
+    install_trans(speculative); // Now install writes to home locations
+    log_crash_test_point(speculative, 5);
     log.lh.n = 0;
     write_head();    // Erase the transaction from the log
+    log_crash_test_point(speculative, 6);
   }
 }
 

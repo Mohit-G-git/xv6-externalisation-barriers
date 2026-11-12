@@ -9,11 +9,28 @@ set qemu [lindex $argv 0]
 set kernel [lindex $argv 1]
 set fs [lindex $argv 2]
 set timeout 120
+set cpus 2
+if {[info exists env(XV6_CPUS)]} {
+  set cpus $env(XV6_CPUS)
+}
+set test_filter ""
+if {[info exists env(XV6_TEST_FILTER)]} {
+  set test_filter $env(XV6_TEST_FILTER)
+}
+
+proc should_run {command} {
+  global test_filter
+  if {$test_filter eq ""} {
+    return 1
+  }
+  set id [string map {" " "-"} $command]
+  return [expr {$test_filter eq $id}]
+}
 
 spawn $qemu -nographic \
   -drive file=$fs,index=1,media=disk,format=raw \
   -drive file=$kernel,index=0,media=disk,format=raw \
-  -smp 2 -m 512
+  -smp $cpus -m 512
 expect {
   "init: starting sh" {}
   timeout { puts stderr "QEMU boot timed out"; exit 1 }
@@ -21,6 +38,9 @@ expect {
 }
 
 proc run_test {command marker} {
+  if {![should_run $command]} {
+    return
+  }
   send -- "$command\r"
   expect {
     -exact $marker { puts "PASS $command" }
@@ -40,6 +60,9 @@ proc run_test {command marker} {
 }
 
 proc run_ordered_test {command first second done forbidden} {
+  if {![should_run $command]} {
+    return
+  }
   send -- "$command\r"
   expect {
     -exact $forbidden {
@@ -94,6 +117,7 @@ proc run_ordered_test {command first second done forbidden} {
 
 run_test "xspec" "XSPEC PASS (filesystem isolation and lifecycle)"
 run_test "xnested" "XNESTED PASS (nested merge and abort)"
+run_ordered_test "xexec" "EXEC_PRECOMMIT" "EXEC_CHILD_OUTPUT" "EXEC_COMMIT_DONE" "EXEC_CHILD_OUTPUT"
 run_test "xio console-abort" "CONSOLE_ABORT_DONE"
 run_ordered_test "xio console-commit" "CONSOLE_COMMIT_OBSERVER" "CONSOLE_COMMIT_PAYLOAD" "CONSOLE_COMMIT_DONE" "CONSOLE_COMMIT_PAYLOAD"
 run_test "xio console-cap" "CONSOLE_CAPACITY_OK"
@@ -111,7 +135,15 @@ run_test "xio pipe-blocked-commit" "PIPE_BLOCKED_COMMIT_DRAINED"
 run_test "xio pipe-blocked-abort" "PIPE_BLOCKED_ABORT_DRAINED"
 run_test "xio owner-exit" "OWNER_EXIT_OBSERVER"
 run_test "xio child-abort" "CHILD_ABORT_DONE"
+set timeout 900
+run_test "usertests" "ALL TESTS PASSED"
 
 send -- "\001x"
 expect eof
-wait
+set qemu_result [wait]
+set qemu_status [lindex $qemu_result 3]
+if {$qemu_status != 0} {
+  puts stderr "QEMU exited with status $qemu_status after the test suite"
+  exit 1
+}
+puts "PASS qemu-shutdown"

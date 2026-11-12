@@ -376,6 +376,7 @@ spec_commit(struct proc *p)
   struct shadow_block block;
   int parent_id = 0;
 
+  log_crash_test_point(1, 0);
   acquire(&spectable.lock);
   ctx = spec_lookup_locked(p->spec_id);
   if(ctx != 0 && ctx->state == SPEC_ACTIVE && ctx->owner == p->pid &&
@@ -429,6 +430,7 @@ spec_commit(struct proc *p)
       release(&spectable.lock);
       return -1;
     }
+    log_crash_test_point(1, 1);
     nblocks = shadow_count(id);
     if(nblocks < 0 || shadow_validate(id) < 0 ||
        shadow_snapshot_begin(id, &snapshot) < 0){
@@ -536,6 +538,7 @@ spec_commit(struct proc *p)
 
     fs_spec_publish(id);
     shadow_discard(id);
+    log_crash_test_point(1, 7);
     spec_output_publish(id);
     fs_gate_publish_end();
     if(proc_spec_scope_prepare(id, 0, 0) <= 0)
@@ -553,6 +556,7 @@ spec_commit(struct proc *p)
     ctx->proc_refs = 0;
     ctx->state = SPEC_COMMITTED;
     wakeup(ctx);
+    spec_reclaim_locked(ctx);
     release(&spectable.lock);
     SPEC_TRACE("commit_done", id, p->pid, 0, 0, 0, 0);
     result = 0;

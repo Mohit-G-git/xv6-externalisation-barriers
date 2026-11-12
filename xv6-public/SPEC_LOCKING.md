@@ -30,6 +30,13 @@ and data-lock acquisitions for workload instrumentation. A dedicated
 `stats_lock` serializes counter updates on SMP; contention is the number of
 acquisition attempts that observed a busy bucket at the sampling point.
 
+The default `SPEC_LOCK_MODE=fine` build uses all shadow buckets independently.
+The benchmark runner also builds `SPEC_LOCK_MODE=coarse`, which routes shadow
+metadata operations through bucket zero while retaining per-entry data locks.
+This is a coarse-grained comparison baseline, not a fully global lock over
+filesystem operations or commit publication. Both variants run the same guest
+workloads under the same CPU-count matrix.
+
 Version counters are volatile because shadow transactions are volatile: after
 a reboot both start from an empty epoch.  First reads are recorded once per
 `(transaction, device, block)` and commit rejects an entry if a committed

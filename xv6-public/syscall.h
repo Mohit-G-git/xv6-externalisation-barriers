@@ -23,3 +23,4 @@
 #define SYS_xbegin 22
 #define SYS_xcommit 23
 #define SYS_xabort 24
+#define SYS_xstats 25

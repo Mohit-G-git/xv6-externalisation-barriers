@@ -307,12 +307,14 @@ test_write_conflict(void)
   close(ready[0]);
   sleep(10); // Let both children write privately before either commits.
   token = 'C';
-  if(write(go1[1], &token, 1) != 1 ||
-     read(result[0], &token, 1) != 1 || token != 'C')
+  if(write(go1[1], &token, 1) != 1)
+    return -1;
+  if(read(result[0], &token, 1) != 1 || token != 'C')
     return -1;
   wait();
-  if(write(go2[1], &token, 1) != 1 ||
-     read(result[0], &token, 1) != 1 || token != 'X')
+  if(write(go2[1], &token, 1) != 1)
+    return -1;
+  if(read(result[0], &token, 1) != 1 || token != 'X')
     return -1;
   wait();
   close(go1[1]);
@@ -333,42 +335,40 @@ test_write_conflict(void)
 static int
 test_read_conflict(void)
 {
-  int fd, go[2], done[2], pid;
+  int fd, done[2], pid;
   char token, value;
 
   fd = open("xspec-read-conflict", O_CREATE|O_RDWR);
   if(fd < 0 || write(fd, "R", 1) != 1 || close(fd) < 0 ||
-     pipe(go) < 0 || pipe(done) < 0)
+     pipe(done) < 0)
     return -1;
   pid = fork();
   if(pid < 0)
     return -1;
   if(pid == 0){
-    close(go[1]);
     close(done[0]);
-    if(read(go[0], &token, 1) != 1)
+    token = 'R';
+    if(write(done[1], &token, 1) != 1)
       exit();
+    sleep(20);
     fd = open("xspec-read-conflict", O_RDWR);
     if(fd < 0 || write(fd, "W", 1) != 1 || close(fd) < 0)
       exit();
     token = 'D';
     write(done[1], &token, 1);
-    close(go[0]);
     close(done[1]);
     exit();
   }
-  close(go[0]);
   close(done[1]);
+  if(read(done[0], &token, 1) != 1 || token != 'R')
+    return -1;
   if(xbegin() <= 0)
     return -1;
   fd = open("xspec-read-conflict", O_RDONLY);
   if(fd < 0 || read(fd, &value, 1) != 1 || value != 'R' || close(fd) < 0)
     return -1;
-  token = 'G';
-  if(write(go[1], &token, 1) != 1 || read(done[0], &token, 1) != 1 ||
-     token != 'D')
+  if(read(done[0], &token, 1) != 1 || token != 'D')
     return -1;
-  close(go[1]);
   close(done[0]);
   wait();
   if(xcommit() >= 0 || xabort() < 0)
@@ -482,7 +482,7 @@ test_shadow_capacity(void)
 static int
 test_journal_capacity(void)
 {
-  int fd;
+  int fd, n, committed;
   struct stat st;
   char value;
 
@@ -490,14 +490,76 @@ test_journal_capacity(void)
   if(xbegin() <= 0)
     return -1;
   fd = open("xspec-journal-capacity", O_CREATE|O_RDWR);
-  if(fd < 0 || write(fd, bulk, 6144) != 6144 || xcommit() < 0 ||
-     close(fd) < 0)
+  if(fd < 0)
+    return -1;
+  n = write(fd, bulk, 6144);
+  if(close(fd) < 0)
+    return -1;
+  if(n != 6144){
+    if(xabort() < 0)
+      return -1;
+    fd = open("xspec-journal-capacity", O_RDONLY);
+    if(fd >= 0){
+      close(fd);
+      return -1;
+    }
+  } else {
+    committed = xcommit();
+    if(committed < 0){
+      if(xabort() < 0)
+        return -1;
+      fd = open("xspec-journal-capacity", O_RDONLY);
+      if(fd >= 0){
+        close(fd);
+        return -1;
+      }
+    } else {
+      fd = open("xspec-journal-capacity", O_RDONLY);
+      if(fd < 0 || fstat(fd, &st) < 0 || st.size != 6144 ||
+         read(fd, &value, 1) != 1 || value != 'J' || close(fd) < 0 ||
+         unlink("xspec-journal-capacity") < 0)
+        return -1;
+    }
+  }
+
+  if(xbegin() <= 0)
+    return -1;
+  fd = open("xspec-journal-capacity", O_CREATE|O_RDWR);
+  if(fd < 0 || write(fd, bulk, 1024) != 1024 ||
+     close(fd) < 0 || xcommit() < 0)
     return -1;
   fd = open("xspec-journal-capacity", O_RDONLY);
-  if(fd < 0 || fstat(fd, &st) < 0 || st.size != 6144 ||
+  if(fd < 0 || fstat(fd, &st) < 0 || st.size != 1024 ||
      read(fd, &value, 1) != 1 || value != 'J' || close(fd) < 0 ||
      unlink("xspec-journal-capacity") < 0)
     return -1;
+  return 0;
+}
+
+static int
+test_context_reuse(void)
+{
+  int i;
+
+  for(i = 0; i < 32; i++)
+    if(xbegin() <= 0 || xcommit() < 0)
+      return -1;
+  return 0;
+}
+
+static int
+test_context_capacity(void)
+{
+  int depth;
+
+  for(depth = 0; depth < 16; depth++)
+    if(xbegin() <= 0)
+      return -1;
+  if(xbegin() > 0)
+    return -1;
+  for(depth = 0; depth < 16; depth++)
+    if(xabort() < 0)
+      return -1;
   return 0;
 }
 
@@ -506,34 +568,53 @@ main(void)
 {
   int fd;
 
+  printf(1, "XSPEC_STAGE lifecycle\n");
   if(xcommit() >= 0 || xabort() >= 0 || xbegin() <= 0)
     fail("lifecycle start");
   if(xcommit() < 0)
     fail("empty-context commit");
 
+  printf(1, "XSPEC_STAGE create-visibility\n");
   if(test_create_visibility() < 0)
     fail("create visibility, snapshot, retry and abort");
+  printf(1, "XSPEC_STAGE namespace-visibility\n");
   if(test_namespace_visibility() < 0)
     fail("directory and hard-link isolation");
+  printf(1, "XSPEC_STAGE chdir-lifecycle\n");
   if(test_chdir_lifecycle() < 0)
     fail("current-directory restore on commit and abort");
+  printf(1, "XSPEC_STAGE unlink-visibility\n");
   if(test_unlink_visibility() < 0)
     fail("unlink visibility and abort");
+  printf(1, "XSPEC_STAGE write-visibility\n");
   if(test_write_visibility() < 0)
     fail("data write visibility and abort");
+  printf(1, "XSPEC_STAGE write-conflict\n");
   if(test_write_conflict() < 0)
     fail("stale write-set conflict validation");
+  printf(1, "XSPEC_STAGE read-conflict\n");
   if(test_read_conflict() < 0)
     fail("stale read-set conflict validation");
+  printf(1, "XSPEC_STAGE create-unlink-reuse\n");
   if(test_create_unlink_reuse() < 0)
     fail("create/unlink reservation transitions");
+  printf(1, "XSPEC_STAGE allocation-arbitration\n");
   if(test_allocation_arbitration() < 0)
     fail("ordinary allocator reservation arbitration");
+  printf(1, "XSPEC_STAGE shadow-capacity\n");
   if(test_shadow_capacity() < 0)
     fail("shadow capacity and abort-only handling");
+  printf(1, "XSPEC_STAGE journal-capacity\n");
   if(test_journal_capacity() < 0)
     fail("publication up to actual journal capacity");
+  printf(1, "XSPEC_STAGE context-reuse\n");
+  if(test_context_reuse() < 0)
+    fail("terminal context reclamation");
+  printf(1, "XSPEC_STAGE context-capacity\n");
+  if(test_context_capacity() < 0)
+    fail("context-table exhaustion and nested cleanup");
 
+  printf(1, "XSPEC_STAGE final-cleanup\n");
   fd = open("xspec-private", O_RDONLY);
   if(fd >= 0){
     close(fd);

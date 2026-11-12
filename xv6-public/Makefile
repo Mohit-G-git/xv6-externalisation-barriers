@@ -68,6 +68,9 @@ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 &
 ifeq ($(SPEC_DEBUG),1)
 CFLAGS += -DSPEC_DEBUG
 endif
+ifeq ($(SPEC_LOCK_MODE),coarse)
+CFLAGS += -DSPEC_COARSE_SHADOW_LOCK
+endif
 ifneq ($(SPEC_CRASH_POINT),)
 CFLAGS += -DSPEC_CRASH_POINT=$(SPEC_CRASH_POINT)
 endif
@@ -180,6 +183,8 @@ UPROGS=\
 	_xio\
 	_xcrash\
 	_xnested\
+	_xbench\
+	_xexec\
 
 fs.img: mkfs README $(UPROGS)
 	./mkfs fs.img README $(UPROGS)

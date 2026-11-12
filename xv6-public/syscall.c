@@ -107,6 +107,7 @@ extern int sys_uptime(void);
 extern int sys_xbegin(void);
 extern int sys_xcommit(void);
 extern int sys_xabort(void);
+extern int sys_xstats(void);
 
 static int (*syscalls[])(void) = {
 [SYS_fork]    sys_fork,
@@ -133,6 +134,7 @@ static int (*syscalls[])(void) = {
 [SYS_xbegin]  sys_xbegin,
 [SYS_xcommit] sys_xcommit,
 [SYS_xabort]  sys_xabort,
+[SYS_xstats]  sys_xstats,
 };
 
 void

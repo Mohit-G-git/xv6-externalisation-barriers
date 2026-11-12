@@ -1,0 +1,41 @@
+#!/usr/bin/expect -f
+
+if {$argc != 4} {
+  puts stderr "usage: benchmark.exp QEMU KERNEL_IMAGE FS_IMAGE CPU_COUNT"
+  exit 2
+}
+
+set qemu [lindex $argv 0]
+set kernel [lindex $argv 1]
+set fs [lindex $argv 2]
+set cpus [lindex $argv 3]
+set timeout 300
+
+spawn $qemu -nographic \
+  -drive file=$fs,index=1,media=disk,format=raw \
+  -drive file=$kernel,index=0,media=disk,format=raw \
+  -smp $cpus -m 512
+expect {
+  "init: starting sh" {}
+  timeout { puts stderr "QEMU boot timed out"; exit 1 }
+  eof { puts stderr "QEMU exited during boot"; exit 1 }
+}
+send -- "xbench\r"
+expect {
+  -exact "XBENCH DONE" {}
+  -re {panic:|XBENCH FAIL|^FAIL} {
+    puts stderr "Guest reported a benchmark failure"
+    exit 1
+  }
+  timeout {
+    puts stderr "Timed out waiting for XBENCH DONE"
+    exit 1
+  }
+  eof {
+    puts stderr "QEMU exited before XBENCH DONE"
+    exit 1
+  }
+}
+send -- "\001x"
+expect eof
+wait

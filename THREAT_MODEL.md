@@ -40,3 +40,18 @@ Kernel diagnostics (`cprintf`/`panic`) are kernel-generated, not user writes; th
 ## Threat assumptions and limits
 
 The kernel is trusted; user processes can issue arbitrary valid syscalls and can fork/exit at adversarial times. DMA devices, power-loss guarantees beyond the xv6 IDE/log model, and kernel memory corruption are outside this project's threat model. The existing journal gives filesystem crash recovery, but console and pipe delivery cannot be made crash-atomic with disk state. The implementation must state the journal commit point and external-output point separately.
+
+## Verification tools and limits
+
+The repository includes host automation for guest functional tests, stock xv6
+`usertests`, and controlled QEMU termination around the redo-journal protocol.
+Crash recovery guarantees are evaluated against the filesystem image after
+restart: an absent durable header means rollback, and a durable header means
+replay. A crash after durable disk commit but before console publication may
+leave the committed filesystem state without its console output. This is an
+expected limitation, not a transaction failure.
+
+The included benchmark reports measured QEMU/xv6 tick counts and does not
+establish a security guarantee, serializability, or parallel speedup. Runtime
+race tests are bounded empirical checks; they cannot prove the absence of all
+concurrency bugs.

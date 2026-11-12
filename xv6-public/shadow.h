@@ -47,6 +47,19 @@ struct shadow_lock_stats {
   uint data_acquires;
 };
 
+struct shadow_metrics {
+  uint allocated;
+  uint peak;
+  uint capacity;
+  uint allocation_failures;
+  uint lookups;
+  uint lookup_hits;
+  uint lookup_misses;
+  uint bucket_acquires;
+  uint bucket_contention;
+  uint data_acquires;
+};
+
 void shadowinit(void);
 int shadow_read(int spec_id, uint dev, uint blockno, char *dst);
 int shadow_write(int spec_id, uint dev, uint blockno, const char *src);
@@ -73,6 +86,7 @@ int shadow_count(int spec_id);
 int shadow_capacity(void);
 int shadow_peak(void);
 void shadow_lock_stats_get(struct shadow_lock_stats *stats);
+void shadow_metrics_get(struct shadow_metrics *stats);
 
 int spec_reservation_claim(int spec_id, int kind, uint dev, uint number,
                            int state, struct spec_reservation_token *token);
