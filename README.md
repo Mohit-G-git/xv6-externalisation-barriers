@@ -15,3 +15,5 @@ available, or can be selected explicitly with
 Guest checks include `xspec`, `xnested`, the relevant `xio` modes, and stock
 `usertests`.
 See `TEST_RESULTS.md` for exact commands and runtime status.
+Console and pipe visibility, bounded buffering, and the disk/console crash
+window are described in `xv6-public/SPEC_IO.md`.
