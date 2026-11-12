@@ -381,6 +381,70 @@ reader_exit(void)
 }
 
 static int
+io_metrics(void)
+{
+  int p[2], pid, start, ordinary_console_ticks;
+  int speculative_console_ticks, ordinary_pipe_ticks, speculative_pipe_ticks;
+  char data[PIPESIZE], c;
+
+  memset(data, '.', sizeof(data));
+  start = uptime();
+  if(write(1, data, sizeof(data)) != sizeof(data))
+    return -1;
+  ordinary_console_ticks = uptime() - start;
+
+  if(xbegin() <= 0)
+    return -1;
+  start = uptime();
+  if(write(1, data, sizeof(data)) != sizeof(data))
+    return -1;
+  speculative_console_ticks = uptime() - start;
+  if(xabort() < 0)
+    return -1;
+
+  if(pipe(p) < 0)
+    return -1;
+  pid = fork();
+  if(pid < 0)
+    return -1;
+  if(pid == 0){
+    close(p[1]);
+    sleep(5);
+    if(read(p[0], &c, 1) != 1)
+      exit();
+    exit();
+  }
+  close(p[0]);
+  if(write(p[1], data, sizeof(data)) != sizeof(data))
+    return -1;
+  start = uptime();
+  if(write(p[1], "W", 1) != 1)
+    return -1;
+  ordinary_pipe_ticks = uptime() - start;
+  close(p[1]);
+  if(wait() != pid)
+    return -1;
+
+  if(pipe(p) < 0 || xbegin() <= 0)
+    return -1;
+  if(write(p[1], data, sizeof(data)) != sizeof(data))
+    return -1;
+  start = uptime();
+  if(write(p[1], "W", 1) != 0)
+    return -1;
+  speculative_pipe_ticks = uptime() - start;
+  if(xabort() < 0)
+    return -1;
+  close(p[0]);
+  close(p[1]);
+
+  printf(1, "IO_METRICS bytes=%d ordinary_console_ticks=%d speculative_console_ticks=%d ordinary_pipe_wait_ticks=%d speculative_full_pipe_ticks=%d\n",
+         PIPESIZE, ordinary_console_ticks, speculative_console_ticks,
+         ordinary_pipe_ticks, speculative_pipe_ticks);
+  return 0;
+}
+
+static int
 ordinary_pipe(void)
 {
   int p[2];
@@ -514,6 +578,9 @@ main(int argc, char **argv)
     if(reader_exit() < 0)
       fail("pipe reader exit");
     printf(1, "PIPE_READER_EXIT_DONE\n");
+  } else if(strcmp(argv[1], "io-metrics") == 0){
+    if(io_metrics() < 0)
+      fail("I/O metrics");
   } else if(strcmp(argv[1], "pipe-ordinary") == 0){
     if(ordinary_pipe() < 0)
       fail("ordinary pipe");

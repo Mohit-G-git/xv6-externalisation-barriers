@@ -48,6 +48,12 @@ reader exit, blocked-reader lifecycle transitions, and ordinary pipes. The
 QEMU harness checks that leak/failure markers are absent and that console and
 pipe output appears only after the relevant commit marker.
 
+Run `xio io-metrics` in the guest to print a 512-byte ordinary-versus-buffered
+console tick comparison and ordinary-blocked versus speculative-full pipe
+write ticks. The guest prints the measured byte count with those values. xv6's
+`uptime()` has coarse tick resolution, so repeat runs and report the raw rows
+rather than interpreting a zero-tick result as zero work.
+
 ## Limits and measurements
 
 The console buffer is bounded to 2 KiB per context and the registry has a
@@ -56,4 +62,4 @@ speculative writes can be short when it fills. Pipe membership is sampled
 from the process context at each syscall, so a process cannot use an ancestor's
 pending bytes from a nested child context until that child merges. The current
 regression suite checks correctness markers; timing and buffer-overhead
-measurements still require a QEMU environment and are not claimed here.
+measurements can be collected with `xio io-metrics` on a QEMU environment.
