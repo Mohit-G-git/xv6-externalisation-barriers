@@ -1,10 +1,9 @@
 // Private block versions used by speculative file-system operations.
 //
-// The table is deliberately bounded.  A single lock protects the hash chains,
-// free-list metadata, reference counts and block contents.  The hash index
-// avoids repeated full-table scans while retaining a simple lock order for
-// this initial storage layer.  Later scalability work can split this lock by
-// bucket without changing the public API.
+// The table is deliberately bounded.  Bucket locks protect independent hash
+// chains and entry pins; the table lock protects the free list and global
+// counters.  Entry data has its own lock so unrelated private blocks can be
+// copied concurrently.
 
 #include "types.h"
 #include "defs.h"
@@ -14,6 +13,7 @@
 #include "shadow.h"
 
 #define NSPEC 16
+#define NSHADOW_BUCKETS 16
 
 enum shadow_state {
   SHADOW_FREE = 0,
@@ -30,9 +30,7 @@ struct shadow_entry {
   uint base_version;
   char base[BSIZE];
   char data[BSIZE];
-  // Metadata is protected by shadow_table.lock; the private image uses an
-  // independent lock so unrelated speculative blocks can be copied in
-  // parallel after a reference has pinned their entries.
+  // Chain metadata and pins are protected by the owning bucket lock.
   struct spinlock data_lock;
 };
 
@@ -60,10 +58,15 @@ struct read_entry {
 static struct {
   struct spinlock lock;
   struct shadow_entry entry[NSHADOW];
-  int head[NSHADOW];
+  struct spinlock bucket_lock[NSHADOW_BUCKETS];
+  int head[NSHADOW_BUCKETS];
   int free_head;
   uint allocated;
   uint peak;
+  uint spec_count[NSPEC];
+  volatile uint bucket_acquires;
+  volatile uint bucket_contention;
+  volatile uint data_acquires;
   int frozen_id[NSPEC];
   uint snapshots[NSPEC];
   uint base_version[NDEV][FSSIZE];
@@ -100,7 +103,29 @@ shadow_hash(int spec_id, uint dev, uint blockno)
   key = (uint)spec_id * 16777619U;
   key ^= dev * 2166136261U;
   key ^= blockno * 709607U;
-  return key % NSHADOW;
+  return key % NSHADOW_BUCKETS;
+}
+
+static void
+shadow_bucket_acquire(int bucket)
+{
+  shadow_table.bucket_acquires++;
+  if(shadow_table.bucket_lock[bucket].locked)
+    shadow_table.bucket_contention++;
+  acquire(&shadow_table.bucket_lock[bucket]);
+}
+
+static void
+shadow_bucket_release(int bucket)
+{
+  release(&shadow_table.bucket_lock[bucket]);
+}
+
+static void
+shadow_data_acquire(struct shadow_entry *entry)
+{
+  shadow_table.data_acquires++;
+  acquire(&entry->data_lock);
 }
 
 static int
@@ -130,14 +155,10 @@ shadow_find_locked(int spec_id, uint dev, uint blockno, int *prev)
 static int
 shadow_count_locked(int spec_id)
 {
-  int i, count;
+  int slot;
 
-  count = 0;
-  for(i = 0; i < NSHADOW; i++)
-    if(shadow_table.entry[i].state == SHADOW_ALLOCATED &&
-       shadow_table.entry[i].spec_id == spec_id)
-      count++;
-  return count;
+  slot = shadow_slot(spec_id);
+  return slot < 0 ? -1 : shadow_table.spec_count[slot];
 }
 
 void
@@ -150,13 +171,18 @@ shadowinit(void)
   shadow_table.free_head = 0;
   shadow_table.allocated = 0;
   shadow_table.peak = 0;
+  memset(shadow_table.spec_count, 0, sizeof(shadow_table.spec_count));
+  shadow_table.bucket_acquires = 0;
+  shadow_table.bucket_contention = 0;
+  shadow_table.data_acquires = 0;
   memset(shadow_table.frozen_id, 0, sizeof(shadow_table.frozen_id));
   memset(shadow_table.snapshots, 0, sizeof(shadow_table.snapshots));
   memset(shadow_table.base_version, 0, sizeof(shadow_table.base_version));
   memset(shadow_table.reads, 0, sizeof(shadow_table.reads));
   memset(reservations.entry, 0, sizeof(reservations.entry));
   reservations.next_version = 1;
-  for(i = 0; i < NSHADOW; i++){
+  for(i = 0; i < NSHADOW_BUCKETS; i++){
+    initlock(&shadow_table.bucket_lock[i], "shadowbucket");
     shadow_table.head[i] = -1;
   }
   for(i = 0; i < NSHADOW; i++){
@@ -212,25 +238,26 @@ shadow_note_read(int spec_id, uint dev, uint blockno)
 int
 shadow_read(int spec_id, uint dev, uint blockno, char *dst)
 {
-  int index;
+  int index, bucket;
 
   if(spec_id <= 0 || dst == 0)
     return -1;
-  acquire(&shadow_table.lock);
+  bucket = shadow_hash(spec_id, dev, blockno);
+  shadow_bucket_acquire(bucket);
   index = shadow_find_locked(spec_id, dev, blockno, 0);
   if(index < 0){
-    release(&shadow_table.lock);
+    shadow_bucket_release(bucket);
     SHADOW_TRACE("block_read", spec_id, dev, blockno, 0, 0);
     return 0;
   }
   shadow_table.entry[index].refs++;
-  release(&shadow_table.lock);
-  acquire(&shadow_table.entry[index].data_lock);
+  shadow_bucket_release(bucket);
+  shadow_data_acquire(&shadow_table.entry[index]);
   memmove(dst, shadow_table.entry[index].data, BSIZE);
   release(&shadow_table.entry[index].data_lock);
-  acquire(&shadow_table.lock);
+  shadow_bucket_acquire(bucket);
   shadow_table.entry[index].refs--;
-  release(&shadow_table.lock);
+  shadow_bucket_release(bucket);
   SHADOW_TRACE("block_read", spec_id, dev, blockno, 0, 1);
   return 1;
 }
@@ -270,11 +297,24 @@ shadow_write_versioned(int spec_id, uint dev, uint blockno,
     SHADOW_TRACE("block_write_rejected", spec_id, dev, blockno, 0, -1);
     return -1;
   }
+  release(&shadow_table.lock);
+  bucket = shadow_hash(spec_id, dev, blockno);
+  shadow_bucket_acquire(bucket);
+  acquire(&shadow_table.lock);
+  if(shadow_table.frozen_id[slot] != 0){
+    release(&shadow_table.lock);
+    shadow_bucket_release(bucket);
+    SHADOW_TRACE("block_write_rejected", spec_id, dev, blockno, 0, -1);
+    return -1;
+  }
+  release(&shadow_table.lock);
   index = shadow_find_locked(spec_id, dev, blockno, 0);
   if(index < 0){
+    acquire(&shadow_table.lock);
     count = shadow_count_locked(spec_id);
     if(count >= NSHADOW_QUOTA || shadow_table.free_head < 0){
       release(&shadow_table.lock);
+      shadow_bucket_release(bucket);
       SHADOW_TRACE("shadow_exhausted", spec_id, dev, blockno,
                    NSHADOW_QUOTA, count);
       return -1;
@@ -293,18 +333,20 @@ shadow_write_versioned(int spec_id, uint dev, uint blockno,
     shadow_table.entry[index].base_version = base_version;
     memmove(shadow_table.entry[index].base, base, BSIZE);
     allocated = 1;
+    shadow_table.spec_count[slot]++;
     shadow_table.allocated++;
     if(shadow_table.allocated > shadow_table.peak)
       shadow_table.peak = shadow_table.allocated;
+    release(&shadow_table.lock);
   }
   shadow_table.entry[index].refs++;
-  release(&shadow_table.lock);
-  acquire(&shadow_table.entry[index].data_lock);
+  shadow_bucket_release(bucket);
+  shadow_data_acquire(&shadow_table.entry[index]);
   memmove(shadow_table.entry[index].data, src, BSIZE);
   release(&shadow_table.entry[index].data_lock);
-  acquire(&shadow_table.lock);
+  shadow_bucket_acquire(bucket);
   shadow_table.entry[index].refs--;
-  release(&shadow_table.lock);
+  shadow_bucket_release(bucket);
   if(allocated)
     SHADOW_TRACE("block_alloc", spec_id, dev, blockno, 0, (int)base_version);
   SHADOW_TRACE("block_write", spec_id, dev, blockno, 0, (int)base_version);
@@ -349,26 +391,34 @@ shadow_note_base_write(uint dev, uint blockno)
 int
 shadow_validate_versions(int spec_id)
 {
-  int i;
+  int i, bucket;
   uint version;
   uint dev, blockno, expected;
 
-  acquire(&shadow_table.lock);
-  for(i = 0; i < NSHADOW; i++){
-    struct shadow_entry *e = &shadow_table.entry[i];
-    if(e->state == SHADOW_ALLOCATED && e->spec_id == spec_id){
+  for(bucket = 0; bucket < NSHADOW_BUCKETS; bucket++){
+    shadow_bucket_acquire(bucket);
+    for(i = 0; i < NSHADOW; i++){
+      struct shadow_entry *e = &shadow_table.entry[i];
+      if(e->state != SHADOW_ALLOCATED || e->spec_id != spec_id ||
+         shadow_hash(e->spec_id, e->dev, e->blockno) != (uint)bucket)
+        continue;
+      acquire(&shadow_table.lock);
       version = shadow_table.base_version[e->dev][e->blockno];
       if(version != e->base_version){
         dev = e->dev;
         blockno = e->blockno;
         expected = e->base_version;
         release(&shadow_table.lock);
+        shadow_bucket_release(bucket);
         SHADOW_TRACE("write_conflict", spec_id, dev, blockno,
                      (int)expected, (int)version);
         return -1;
       }
+      release(&shadow_table.lock);
     }
+    shadow_bucket_release(bucket);
   }
+  acquire(&shadow_table.lock);
   for(i = 0; i < NSPEC_RESERVATIONS; i++){
     struct read_entry *r = &shadow_table.reads[i];
     if(r->used && r->spec_id == spec_id){
@@ -447,32 +497,37 @@ shadow_snapshot_begin(int spec_id, struct shadow_snapshot *snap)
 int
 shadow_snapshot_next(struct shadow_snapshot *snap, struct shadow_block *block)
 {
-  int i, seen;
+  int i, bucket, seen;
 
   if(snap == 0 || block == 0 || !snap->active)
     return -1;
-  acquire(&shadow_table.lock);
   seen = 0;
-  for(i = 0; i < NSHADOW; i++){
-    if(shadow_table.entry[i].state != SHADOW_ALLOCATED ||
-       shadow_table.entry[i].spec_id != snap->spec_id)
-      continue;
-    if(seen++ < snap->cursor)
-      continue;
-    block->dev = shadow_table.entry[i].dev;
-    block->blockno = shadow_table.entry[i].blockno;
-    snap->cursor++;
-    shadow_table.entry[i].refs++;
-    release(&shadow_table.lock);
-    acquire(&shadow_table.entry[i].data_lock);
-    memmove(block->data, shadow_table.entry[i].data, BSIZE);
-    release(&shadow_table.entry[i].data_lock);
-    acquire(&shadow_table.lock);
-    shadow_table.entry[i].refs--;
-    release(&shadow_table.lock);
-    return 1;
+  for(bucket = 0; bucket < NSHADOW_BUCKETS; bucket++){
+    shadow_bucket_acquire(bucket);
+    for(i = 0; i < NSHADOW; i++){
+      if(shadow_table.entry[i].state != SHADOW_ALLOCATED ||
+         shadow_table.entry[i].spec_id != snap->spec_id ||
+         shadow_hash(shadow_table.entry[i].spec_id,
+                     shadow_table.entry[i].dev,
+                     shadow_table.entry[i].blockno) != (uint)bucket)
+        continue;
+      if(seen++ < snap->cursor)
+        continue;
+      block->dev = shadow_table.entry[i].dev;
+      block->blockno = shadow_table.entry[i].blockno;
+      snap->cursor++;
+      shadow_table.entry[i].refs++;
+      shadow_bucket_release(bucket);
+      shadow_data_acquire(&shadow_table.entry[i]);
+      memmove(block->data, shadow_table.entry[i].data, BSIZE);
+      release(&shadow_table.entry[i].data_lock);
+      shadow_bucket_acquire(bucket);
+      shadow_table.entry[i].refs--;
+      shadow_bucket_release(bucket);
+      return 1;
+    }
+    shadow_bucket_release(bucket);
   }
-  release(&shadow_table.lock);
   return 0;
 }
 
@@ -499,7 +554,7 @@ shadow_snapshot_end(struct shadow_snapshot *snap)
 int
 shadow_validate(int spec_id)
 {
-  int i, slot, count;
+  int i, bucket, slot, count;
 
   if(spec_id <= 0)
     return -1;
@@ -515,17 +570,22 @@ shadow_validate(int spec_id)
     release(&shadow_table.lock);
     return -1;
   }
+  release(&shadow_table.lock);
   // The hash insertion path forbids duplicate keys; verify that invariant
   // while the frozen set is stable before handing it to a publisher.
-  for(i = 0; i < NSHADOW; i++){
-    struct shadow_entry *e = &shadow_table.entry[i];
-    if(e->state == SHADOW_ALLOCATED && e->spec_id == spec_id &&
-       shadow_find_locked(spec_id, e->dev, e->blockno, 0) != i){
-      release(&shadow_table.lock);
-      return -1;
+  for(bucket = 0; bucket < NSHADOW_BUCKETS; bucket++){
+    shadow_bucket_acquire(bucket);
+    for(i = 0; i < NSHADOW; i++){
+      struct shadow_entry *e = &shadow_table.entry[i];
+      if(e->state == SHADOW_ALLOCATED && e->spec_id == spec_id &&
+         shadow_hash(e->spec_id, e->dev, e->blockno) == (uint)bucket &&
+         shadow_find_locked(spec_id, e->dev, e->blockno, 0) != i){
+        shadow_bucket_release(bucket);
+        return -1;
+      }
     }
+    shadow_bucket_release(bucket);
   }
-  release(&shadow_table.lock);
   return 0;
 }
 
@@ -542,7 +602,9 @@ shadow_discard(int spec_id)
     release(&shadow_table.lock);
     panic("shadow_discard: snapshot active");
   }
-  for(i = 0; i < NSHADOW; i++){
+  release(&shadow_table.lock);
+  for(i = 0; i < NSHADOW_BUCKETS; i++){
+    shadow_bucket_acquire(i);
     previous = -1;
     index = shadow_table.head[i];
     while(index >= 0){
@@ -555,18 +617,25 @@ shadow_discard(int spec_id)
           shadow_table.head[i] = next;
         else
           shadow_table.entry[previous].next = next;
+        acquire(&shadow_table.lock);
         memset(&shadow_table.entry[index], 0,
                sizeof(shadow_table.entry[index]));
         shadow_table.entry[index].state = SHADOW_FREE;
         shadow_table.entry[index].next = shadow_table.free_head;
         shadow_table.free_head = index;
         shadow_table.allocated--;
+        if(shadow_table.spec_count[slot] == 0)
+          panic("shadow_discard: count");
+        shadow_table.spec_count[slot]--;
+        release(&shadow_table.lock);
       } else {
         previous = index;
       }
       index = next;
     }
+    shadow_bucket_release(i);
   }
+  acquire(&shadow_table.lock);
   if(shadow_table.frozen_id[slot] == spec_id)
     shadow_table.frozen_id[slot] = 0;
   for(i = 0; i < NSPEC_RESERVATIONS; i++)
@@ -604,6 +673,18 @@ shadow_peak(void)
   peak = shadow_table.peak;
   release(&shadow_table.lock);
   return peak;
+}
+
+void
+shadow_lock_stats_get(struct shadow_lock_stats *stats)
+{
+  if(stats == 0)
+    return;
+  acquire(&shadow_table.lock);
+  stats->bucket_acquires = shadow_table.bucket_acquires;
+  stats->bucket_contention = shadow_table.bucket_contention;
+  stats->data_acquires = shadow_table.data_acquires;
+  release(&shadow_table.lock);
 }
 
 static int

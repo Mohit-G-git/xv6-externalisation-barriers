@@ -7,6 +7,7 @@ struct proc;
 struct rtcdate;
 struct spinlock;
 struct sleeplock;
+struct shadow_lock_stats;
 struct stat;
 struct superblock;
 
@@ -160,6 +161,7 @@ void            shadow_discard(int);
 int             shadow_count(int);
 int             shadow_capacity(void);
 int             shadow_peak(void);
+void            shadow_lock_stats_get(struct shadow_lock_stats*);
 int             spec_abort(struct proc*);
 int             spec_begin(struct proc*);
 int             spec_commit(struct proc*);

@@ -144,8 +144,10 @@ Entries are indexed by a chained hash table using
 independent versions in different speculations and duplicate entries cannot be
 created for one speculation.
 
-The initial implementation uses short-lived spinlocks for the shadow table
-and reservation table. `shadow_write_image` installs a complete private image
+The shadow table uses independent bucket spinlocks for hash chains and entry
+pins, per-entry data locks for private images, and a metadata spinlock for the
+free list, global counters, freeze state, and version/read-set metadata.
+`shadow_write_image` installs a complete private image
 supplied by the caller (the filesystem helper merges the base image before
 its first partial update), enforces the per-speculation `NSHADOW_QUOTA` and
 global `NSHADOW` limits, and returns `-1` on exhaustion. It never writes
@@ -198,7 +200,8 @@ journal completion, refreshes base inode views, and only then publishes held
 output. A conflicting base block or a set larger than the actual journal
 capacity fails before home-buffer publication and leaves the context abortable.
 Abort invalidates speculative inode views and discards shadow blocks,
-reservations and held output. Full read-set/MVCC validation remains a later
-extension; Step 6 validates write-write conflicts only.
+reservations and held output. Read and write base-version validation is implemented with a deduplicated read
+set and conservative abort-on-conflict. This is MVCC-inspired optimistic
+validation; durable multi-version snapshots remain outside the scope.
 
 Nested `xbegin()` is currently rejected. Aborted descendants retain the aborted association and cannot mutate until they explicitly begin a fresh context. Committed descendants detach when they next attempt a mutation. These rules avoid treating an aborted shared handle as an ordinary writable process.

@@ -33,7 +33,7 @@ Kernel diagnostics (`cprintf`/`panic`) are kernel-generated, not user writes; th
 7. **Lifetime:** A context cannot be reclaimed while it has process references, active-operation references, or subsystem cleanup/publication in progress.
 8. **Fork atomicity:** Child membership and its reference are established before the child becomes RUNNABLE; failed fork releases any acquired reference.
 9. **Exit safety:** Every exiting participant drops exactly one membership reference. Owner exit triggers abort. Context cleanup is idempotent.
-10. **Conflict rule:** Initial design uses conservative abort-on-conflict. A version check must cover each written block before publication; stale-read detection requires an explicit read set and is a later extension.
+10. **Conflict rule:** The implementation uses conservative abort-on-conflict. Version checks cover each written block and each first-read block before publication; versions are volatile and reset after reboot.
 11. **Locking:** Registry and state locks protect metadata only. Blocking disk operations, sleep, and publication callbacks do not run while holding registry spinlocks; xv6's `sleep(chan, lk)` atomically releases and reacquires its supplied lock.
 12. **Supported atomicity limit:** A commit either publishes its entire supported disk write set through one journal transaction or fails before publishing any block. Multi-transaction partial publication is not called atomic.
 
