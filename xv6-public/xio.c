@@ -3,6 +3,9 @@
 
 #define PIPESIZE 512
 
+// Keep the large console-capacity buffer out of main's one-page user stack.
+static char console_test_buf[2048];
+
 static void
 fail(char *s)
 {
@@ -499,7 +502,6 @@ blocked_reader_transition(int commit)
 int
 main(int argc, char **argv)
 {
-  char buf[2049];
   int pid;
 
   if(argc < 2)
@@ -537,8 +539,9 @@ main(int argc, char **argv)
     wait();
     printf(1, "CONSOLE_COMMIT_DONE\n");
   } else if(strcmp(argv[1], "console-cap") == 0){
-    memset(buf, 'Q', 2048);
-    if(xbegin() <= 0 || write(1, buf, 2048) != 2048 ||
+    memset(console_test_buf, 'Q', sizeof(console_test_buf));
+    if(xbegin() <= 0 || write(1, console_test_buf, sizeof(console_test_buf)) !=
+       sizeof(console_test_buf) ||
        write(1, "Z", 1) >= 0 || xabort() < 0)
       fail("console capacity handling");
     printf(1, "CONSOLE_CAPACITY_OK\n");
