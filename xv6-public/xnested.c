@@ -6,6 +6,9 @@
 static void
 fail(char *message)
 {
+  // Failure diagnostics must escape any active speculative console buffer.
+  while(xabort() == 0)
+    ;
   printf(2, "XNESTED FAIL: %s\n", message);
   exit();
 }
