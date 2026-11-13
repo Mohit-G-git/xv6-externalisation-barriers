@@ -117,6 +117,15 @@ pipewrite(struct pipe *p, char *addr, int n)
   specid = myproc()->spec_id;
   acquire(&p->lock);
   for(i = 0; i < n; i++){
+    // Do not accept bytes after the final reader has closed.  In a
+    // speculative write, return the short count so the caller can abort
+    // without publishing output to a pipe nobody can consume.
+    if(p->readopen == 0 || myproc()->killed){
+      if(i > 0)
+        wakeup(&p->nread);
+      release(&p->lock);
+      return specid != 0 ? i : -1;
+    }
     while(p->nwrite == p->nread + PIPESIZE){  //DOC: pipewrite-full
       if(p->readopen == 0 || myproc()->killed){
         if(i > 0)
